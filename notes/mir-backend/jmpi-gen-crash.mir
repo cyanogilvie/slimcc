@@ -1,0 +1,56 @@
+dg:	module
+	import	printf
+fmt:	string	"%d\n\000"
+p0:	proto	i32, i64:a0, i32:a1
+p1:	proto	i32, i32:a0
+chk:	func	i32, i32:A0
+	local	i64:r, i64:f
+	mov	f, fmt
+	call	p0, printf, r, f, A0
+	ret	r
+	endfunc
+	export	main
+main:	func	i32
+	local	i64:r2
+	local	i64:T0, i64:T1, i64:T2, i64:T3, i64:T4, i64:T5
+	local	i64:a, i64:b, i64:c, i64:v, i64:w, i64:x, i64:t
+	alloca	T0, 16
+	alloca	T1, 16
+	alloca	T2, 16
+	alloca	T3, 16
+	alloca	T4, 16
+	alloca	T5, 16
+	laddr	a, L1
+	mov	i64:(T0), a
+	mov	i32:(T1), 0
+	mov	v, i64:(T0)
+	jmpi	v
+L1:
+	mov	t, i32:(T1)
+	adds	t, t, 1
+	mov	i32:(T1), t
+	call	p1, chk, r2, t
+	laddr	b, L2
+	mov	i64:(T2), b
+	mov	i32:(T3), 0
+	mov	w, i64:(T2)
+	jmpi	w
+L2:
+	mov	t, i32:(T3)
+	adds	t, t, 2
+	mov	i32:(T3), t
+	call	p1, chk, r2, t
+	laddr	c, L3
+	mov	i64:(T4), c
+	mov	i32:(T5), 0
+	mov	x, i64:(T4)
+	jmpi	x
+L3:
+	mov	t, i32:(T5)
+	adds	t, t, 3
+	mov	i32:(T5), t
+	call	p1, chk, r2, t
+	mov	t, 0
+	ret	t
+	endfunc
+	endmodule

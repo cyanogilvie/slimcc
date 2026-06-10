@@ -127,3 +127,34 @@ clean:
 	rm -f *.o test/*.o test/*.exe test/host/*.o test/abi/*.o
 
 .PHONY: clean test test-stage2 test-all test-san test-filc
+
+# MIR JIT backend library (libslimcc) - see libslimcc.h
+
+MIR_DIR?=../mir
+
+LIB_SRCS=alloc.c bitint.c hashmap.c parse.c preprocess.c strings.c tokenize.c type.c unicode.c
+LIB_OBJS=$(LIB_SRCS:.c=.lib.o) codegen-mir.lib.o libslimcc.lib.o platform-mir.lib.o
+LIB_CFLAGS=-I. -I$(MIR_DIR) -fPIC
+
+.SUFFIXES: .lib.o
+
+.c.lib.o:
+	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c $<
+
+codegen-mir.lib.o libslimcc.lib.o: codegen-mir.h libslimcc.h
+
+platform-mir.lib.o: platform/mir.c slimcc.h
+	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c platform/mir.c
+
+$(LIB_OBJS): slimcc.h
+
+libslimcc.a: $(LIB_OBJS)
+	ar rcs $@ $(LIB_OBJS)
+
+slimcc-mir-run: mir-run.c libslimcc.a $(MIR_DIR)/libmir.a
+	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ mir-run.c libslimcc.a $(MIR_DIR)/libmir.a -lm -ldl
+
+clean-lib:
+	rm -f libslimcc.a slimcc-mir-run *.lib.o
+
+.PHONY: clean-lib
