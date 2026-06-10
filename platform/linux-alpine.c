@@ -11,6 +11,11 @@ void platform_init_cc1(void) {
 }
 
 void platform_init_driver(void) {
+  define_macro("__amd64", "1");
+  define_macro("__amd64__", "1");
+  define_macro("__x86_64", "1");
+  define_macro("__x86_64__", "1");
+
   init_ty_lp64();
 
   dumpmachine_str = "x86_64-alpine-linux-musl";

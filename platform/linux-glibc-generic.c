@@ -10,6 +10,11 @@ void platform_init_cc1(void) {
   define_macro("__linux__", "1");
   define_macro("__gnu_linux__", "1");
 
+  define_macro("__amd64", "1");
+  define_macro("__amd64__", "1");
+  define_macro("__x86_64", "1");
+  define_macro("__x86_64__", "1");
+
   init_ty_lp64();
 }
 

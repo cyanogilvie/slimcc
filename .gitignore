@@ -9,3 +9,7 @@
 /slimcc-asan
 /slimcc-filc
 /slimcc-lto*
+/platform.c
+/libslimcc.a
+/slimcc-mir-run
+**/*.lib.o

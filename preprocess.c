@@ -1579,33 +1579,36 @@ static Token *counter_macro(Token *start) {
   return new_num_token(i++, start, start->next);
 }
 
+// Cached __DATE__/__TIME__ strings; they live in cc1_arena, so they must
+// be dropped between compilations in library mode (preprocess_reset).
+static char *date_macro_str;
+static char *time_macro_str;
+
 // __DATE__ is expanded to the current date, e.g. "May 17 2020".
 static Token *date_macro(Token *start) {
-  static char *str;
-  if (!str) {
+  if (!date_macro_str) {
     if (!cur_time)
       cur_time = localtime(&(time_t){time(NULL)});
 
     static const char mon[][4] = {
       "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     };
-    str = arena_format(&cc1_arena, "\"%s %2d %d\"", mon[cur_time->tm_mon],
-                       cur_time->tm_mday, cur_time->tm_year + 1900);
+    date_macro_str = arena_format(&cc1_arena, "\"%s %2d %d\"", mon[cur_time->tm_mon],
+                                  cur_time->tm_mday, cur_time->tm_year + 1900);
   }
-  return make_token(str, start, start->next);
+  return make_token(date_macro_str, start, start->next);
 }
 
 // __TIME__ is expanded to the current time, e.g. "13:34:03".
 static Token *time_macro(Token *start) {
-  static char *str;
-  if (!str) {
+  if (!time_macro_str) {
     if (!cur_time)
       cur_time = localtime(&(time_t){time(NULL)});
 
-    str = arena_format(&cc1_arena, "\"%02d:%02d:%02d\"", cur_time->tm_hour,
-                       cur_time->tm_min, cur_time->tm_sec);
+    time_macro_str = arena_format(&cc1_arena, "\"%02d:%02d:%02d\"", cur_time->tm_hour,
+                                  cur_time->tm_min, cur_time->tm_sec);
   }
-  return make_token(str, start, start->next);
+  return make_token(time_macro_str, start, start->next);
 }
 
 // __TIMESTAMP__ is expanded to a string describing the last
@@ -1804,11 +1807,6 @@ void init_macros(void) {
 
   define_macro("__CHAR_BIT__", "8");
   define_macro("__BITINT_MAXWIDTH__", "65535");
-
-  define_macro("__amd64", "1");
-  define_macro("__amd64__", "1");
-  define_macro("__x86_64", "1");
-  define_macro("__x86_64__", "1");
 
   add_builtin("__DATE__", date_macro, true);
   add_builtin("__TIME__", time_macro, true);
@@ -2189,5 +2187,25 @@ Token *prepare_parse(Token *tok) {
   free(pragma_once.buckets);
   free(include_guards.buckets);
   free(cond_incl.data);
+  macros = pragma_once = include_guards = (HashMap){0};
+  memset(&cond_incl, 0, sizeof(cond_incl));
   return tok;
+}
+
+// Reset all preprocessor state so a new compilation can run in the same
+// process (library mode). Storage reachable from the maps is owned by the
+// arenas or freed in prepare_parse; remaining buckets are freed here.
+void preprocess_reset(void) {
+  free(macros.buckets);
+  free(pragma_once.buckets);
+  free(include_guards.buckets);
+  free(cond_incl.data);
+  macros = pragma_once = include_guards = (HashMap){0};
+  memset(&cond_incl, 0, sizeof(cond_incl));
+  locked_macros = NULL;
+  base_file = NULL;
+  cur_time = NULL;
+  date_macro_str = time_macro_str = NULL;
+  last_alloc_tok = NULL;
+  tok_freelist = NULL;
 }
