@@ -6,6 +6,11 @@ void platform_init_cc1(void) {
   define_macro("__FreeBSD__", "15");
   define_macro("__extension__", "");
 
+  define_macro("__amd64", "1");
+  define_macro("__amd64__", "1");
+  define_macro("__x86_64", "1");
+  define_macro("__x86_64__", "1");
+
   init_ty_lp64();
 }
 
