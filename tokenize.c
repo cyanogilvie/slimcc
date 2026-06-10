@@ -28,13 +28,19 @@ static void remove_backslash_newline(char *p, SlashDelta *dlt);
 
 #define Is_c_ident(c) (Isalnum(c) || (c) == '_' || (c) == '$')
 
+// Diagnostics sink; NULL means stderr. Library mode points this at a
+// memstream to capture error messages.
+FILE *slimcc_diag_file;
+
+#define errf() (slimcc_diag_file ? slimcc_diag_file : stderr)
+
 // Reports an error and exit.
 void error(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  vfprintf(errf(), fmt, ap);
   va_end(ap);
-  fprintf(stderr, "\n");
+  fprintf(errf(), "\n");
   cleanup_exit(1);
 }
 
@@ -54,16 +60,16 @@ static void verror_at(const char *filename, const char *input, int line_no,
     end++;
 
   // Print out the line.
-  fprintf(stderr, "%s:%d: \n", filename, line_no);
-  fprintf(stderr, "%.*s\n", (int)(end - line), line);
+  fprintf(errf(), "%s:%d: \n", filename, line_no);
+  fprintf(errf(), "%.*s\n", (int)(end - line), line);
 
   // Show the error message.
   int pos = display_width(line, loc - line);
 
-  fprintf(stderr, "%*s", pos, ""); // print pos spaces.
-  fprintf(stderr, "^ ");
-  vfprintf(stderr, fmt, ap);
-  fprintf(stderr, "\n");
+  fprintf(errf(), "%*s", pos, ""); // print pos spaces.
+  fprintf(errf(), "^ ");
+  vfprintf(errf(), fmt, ap);
+  fprintf(errf(), "\n");
 }
 
 void verror_at_tok(Token *tok, const char *fmt, va_list ap) {
@@ -72,7 +78,7 @@ void verror_at_tok(Token *tok, const char *fmt, va_list ap) {
   } else {
     if (!tok->origin && tok->display_line_no) {
       if (tok->file->file_no != tok->display_file_no || tok->line_no != tok->display_line_no)
-        fprintf(stderr, "%s:%d | ", display_files.data[tok->display_file_no],
+        fprintf(errf(), "%s:%d | ", display_files.data[tok->display_file_no],
                 tok->display_line_no);
     }
     verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
@@ -1254,18 +1260,34 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
   return head.next;
 }
 
-Token *tokenize_file(const char *path, Token *tok, Token **end) {
-  FILE *fp;
+// In-memory files for library mode; consulted by name before the
+// filesystem. Contents are owned by the caller and must outlive all
+// compilations that use them.
+static HashMap vfiles;
 
-  if (strcmp(path, "-") == 0) {
-    // By convention, read from stdin if a given filename is "-".
-    fp = stdin;
-  } else {
-    fp = fopen(path, "r");
-    if (!fp) {
-      if (tok)
-        error_tok(tok, "%s: cannot open file: %s", path, strerror(errno));
-      error("%s: cannot open file: %s", path, strerror(errno));
+void slimcc_vfile_add(const char *name, const char *contents) {
+  hashmap_put(&vfiles, name, (void *)contents);
+}
+
+const char *slimcc_vfile_get(const char *name) {
+  return vfiles.buckets ? hashmap_get(&vfiles, name) : NULL;
+}
+
+Token *tokenize_file(const char *path, Token *tok, Token **end) {
+  FILE *fp = NULL;
+  const char *vcontents = slimcc_vfile_get(path);
+
+  if (!vcontents) {
+    if (strcmp(path, "-") == 0) {
+      // By convention, read from stdin if a given filename is "-".
+      fp = stdin;
+    } else {
+      fp = fopen(path, "r");
+      if (!fp) {
+        if (tok)
+          error_tok(tok, "%s: cannot open file: %s", path, strerror(errno));
+        error("%s: cannot open file: %s", path, strerror(errno));
+      }
     }
   }
 
@@ -1274,15 +1296,19 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
   FILE *out = open_memstream(&buf, &buflen);
 
   // Read the entire file.
-  for (;;) {
-    char buf2[4096];
-    int n = fread(buf2, 1, sizeof(buf2), fp);
-    if (n == 0)
-      break;
-    fwrite(buf2, 1, n, out);
+  if (vcontents) {
+    fwrite(vcontents, 1, strlen(vcontents), out);
+  } else {
+    for (;;) {
+      char buf2[4096];
+      int n = fread(buf2, 1, sizeof(buf2), fp);
+      if (n == 0)
+        break;
+      fwrite(buf2, 1, n, out);
+    }
   }
 
-  if (fp != stdin)
+  if (fp && fp != stdin)
     fclose(fp);
 
   // Make sure that the last line is properly terminated with '\n'.
@@ -1304,9 +1330,10 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
   return tokenize(new_file(path, buf), &dlt, end);
 }
 
+static HashMap display_file_map;
+
 int add_display_file(const char *path) {
-  static HashMap map;
-  HashEntry *ent = hashmap_get_or_insert(&map, path, strlen(path));
+  HashEntry *ent = hashmap_get_or_insert(&display_file_map, path, strlen(path));
   int *idx = ent->val;
   if (idx)
     return *idx;
@@ -1387,4 +1414,15 @@ static void remove_backslash_newline(char *start, SlashDelta *dlt) {
 
     *q = '\0';
   }
+}
+
+// Reset tokenizer state so a new compilation can run in the same process
+// (library mode). The display-file map's index storage lives in pp_arena,
+// so it must not survive across compilations. Registered virtual files are
+// caller-owned and deliberately kept.
+void tokenize_reset(void) {
+  current_file = NULL;
+  at_bol = has_space = false;
+  free(display_file_map.buckets);
+  display_file_map = (HashMap){0};
 }
