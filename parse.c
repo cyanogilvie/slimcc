@@ -6104,3 +6104,22 @@ Obj *parse(Token *tok) {
 
   return glb_head->next;
 }
+
+// Reset all parser state so a new compilation can run in the same process
+// (library mode). Symbol storage is owned by the arenas; the bucket arrays
+// are freed here.
+void parse_reset(void) {
+  static Obj globals_init;
+  static Scope scope_init;
+  globals_init = (Obj){0};
+  scope_init = (Scope){0};
+  globals = &globals_init;
+  scope = &scope_init;
+  free(symbols.buckets);
+  symbols = (HashMap){0};
+  fnctx = NULL;
+  eval_recover = NULL;
+  jump_ctx = NULL;
+  memset(&pack_stk, 0, sizeof(pack_stk));
+  is_redecl_context = false;
+}

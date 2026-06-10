@@ -457,6 +457,12 @@ bool is_pp_token_int(Token *tok);
 TokenKind ident_keyword(Token *tok);
 void convert_ucn_ident(Token *tok);
 
+// Library (JIT) mode support
+extern FILE *slimcc_diag_file;
+void slimcc_vfile_add(const char *name, const char *contents);
+const char *slimcc_vfile_get(const char *name);
+void tokenize_reset(void);
+
 #define internal_error() error_ice(__FILE__, __LINE__)
 
 //
@@ -471,6 +477,7 @@ void dump_defines(FILE *out);
 Token *preprocess(const char *file, StringArray *incls, StringArray *macros);
 Token *prepare_parse(Token *tok);
 Token *skip_line(Token *tok);
+void preprocess_reset(void);
 extern Token *last_alloc_tok;
 extern Token *tok_freelist;
 
@@ -819,6 +826,7 @@ Obj *eval_var_opt(Node *node, int *ofs, bool let_array, bool let_atomic);
 bool equal_tok(Token *a, Token *b);
 Obj *get_symbol_var(const char *);
 Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **cond_var);
+void parse_reset(void);
 
 //
 // bitint.c
@@ -1017,6 +1025,7 @@ int64_t bit_size(Type *ty);
 int64_t bitint_buffer_size(Type *ty);
 int32_t bitfield_footprint(Member *mem);
 void init_ty_lp64(void);
+void type_reset(void);
 Type *copy_type(Type *ty);
 Type *pointer_to(Type *base);
 Type *ptr_decay(Type *ty);

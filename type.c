@@ -528,20 +528,27 @@ bool is_compatible(Type *t1, Type *t2) {
   return false;
 }
 
+// Cached `void *`; lives in cc1_arena, so it must be dropped between
+// compilations in library mode (type_reset).
+static Type *void_ptr_cache;
+
 Type *pointer_to(Type *base) {
   if (base == ty_void) {
-    static Type *vp;
-    if (!vp) {
-      vp = new_type(TY_PTR, 8, 8);
-      vp->base = base;
-      vp->is_unsigned = true;
+    if (!void_ptr_cache) {
+      void_ptr_cache = new_type(TY_PTR, 8, 8);
+      void_ptr_cache->base = base;
+      void_ptr_cache->is_unsigned = true;
     }
-    return vp;
+    return void_ptr_cache;
   }
   Type *ty = new_type(TY_PTR, 8, 8);
   ty->base = base;
   ty->is_unsigned = true;
   return ty;
+}
+
+void type_reset(void) {
+  void_ptr_cache = NULL;
 }
 
 Type *ptr_decay(Type *ty) {
