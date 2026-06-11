@@ -205,7 +205,23 @@ Results on Alpine aarch64:
   musl-specific failures.
 
 Conclusion: aarch64+musl is validated to the same level as the glibc
-targets. `support-musl-std-libs` is a candidate upstream PR (fixes #307).
+targets. `support-musl-std-libs` filed upstream as **PR #435** (fixes #307).
+
+### Re-verification on resized boxes (2026-06-11, later same day)
+
+- **Ubuntu glibc aarch64** (ubuntu@56.124.86.243, c8g 1.8GB): slimcc suite
+  re-baselined at **89/103** — unicode.c joined the failure set exactly as
+  predicted after the wchar_t fix (same 14-test list as Alpine; the two
+  aarch64 environments are now identical). Full upstream `make test` on the
+  merged `meson` tip: 5 modes 1073/1073, gen-bb only the 3 pre-existing LD
+  failures, all bootstraps passed, jcall.c passes on glibc.
+- **Alpine musl aarch64** (alpine@15.229.2.189, 1.85GB RAM + 2GB swap,
+  4GB disk): full suite green except jcall.c (gen modes, known) and
+  `c2mir-bb-bootstrap-test`, which the kernel OOM-killed at 1.78GB anon-RSS
+  / 4.4GB total-vm even with swap — the `-p4` parallel lazy-bb self-compile
+  needs >2GB on musl (glibc fits in the same RAM; musl mallocng peak is
+  higher). The lazy-bb *mode* itself is green in c-tests gen-bb; the
+  sequential (-p1) bootstrap result is recorded below.
 
 Validation: full upstream `make test` green on x86_64 (incl. all
 bootstraps); c-tests gen suite 1072/1072 on each topic branch; slimcc
