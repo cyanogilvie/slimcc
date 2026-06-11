@@ -2146,12 +2146,26 @@ Token *preprocess(const char *file, StringArray *incls, StringArray *imacros) {
 Token *prepare_parse(Token *tok) {
   {
     Token *cur;
-    Token *head = tokenize(new_file("slimcc_builtins", "typedef struct {"
-                                                       "  unsigned int gp_offset;"
-                                                       "  unsigned int fp_offset;"
-                                                       "  void *overflow_arg_area;"
-                                                       "  void *reg_save_area;"
-                                                       "} __builtin_va_list[1];"),
+    Token *head = tokenize(new_file("slimcc_builtins",
+#ifdef __aarch64__
+                                    // AAPCS64 va_list; matches what the MIR
+                                    // backend's va_start writes on this host.
+                                    "typedef struct {"
+                                    "  void *__stack;"
+                                    "  void *__gr_top;"
+                                    "  void *__vr_top;"
+                                    "  int __gr_offs;"
+                                    "  int __vr_offs;"
+                                    "} __builtin_va_list[1];"
+#else
+                                    "typedef struct {"
+                                    "  unsigned int gp_offset;"
+                                    "  unsigned int fp_offset;"
+                                    "  void *overflow_arg_area;"
+                                    "  void *reg_save_area;"
+                                    "} __builtin_va_list[1];"
+#endif
+                                    ),
                            NULL, &cur);
 
     const char *path = search_include_paths("bitint_builtins", NULL);

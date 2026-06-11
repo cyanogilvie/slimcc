@@ -9,6 +9,7 @@
 #include "mir-gen.h"
 #include <dlfcn.h>
 #include <libgen.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
