@@ -1175,6 +1175,15 @@ static MIR_reg_t gen_addr(Node *node) {
       error_tok(node->tok, "thread-local storage is not supported by the MIR backend");
     MIR_reg_t r = new_tmp(MIR_T_I64);
     out(MIR_new_insn(mc, MIR_MOV, rop(r), MIR_new_ref_op(mc, sym_item(var))));
+    // Over-aligned objects live at the rounded-up address inside their
+    // over-allocated bss (see emit_data_obj); every code reference rounds
+    // the same way, so the convention holds across modules, and a host
+    // symbol that is already aligned masks to itself.
+    int32_t align = obj_align(var);
+    if (align > 16 && var->ty->kind != TY_FUNC) {
+      r = i64_op2(MIR_ADD, r, iop(align - 1));
+      r = i64_op2(MIR_AND, r, iop(-(int64_t)align));
+    }
     return r;
   }
   case ND_DEREF:
@@ -2030,6 +2039,14 @@ void emit_text(Obj *fn) {
 // File-scope data
 //
 
+// First nonzero byte, or NULL if the range is all zero.
+static const void *memchr_inv_zero(const char *p, int64_t n) {
+  for (int64_t i = 0; i < n; i++)
+    if (p[i])
+      return p + i;
+  return NULL;
+}
+
 static void emit_data_obj(Obj *var) {
   if (var->is_tls)
     error("thread-local storage is not supported by the MIR backend");
@@ -2046,6 +2063,24 @@ static void emit_data_obj(Obj *var) {
   else if (var->ty->size < 0)
     error("object '%s' has incomplete type", name);
 
+  // MIR data items only guarantee malloc alignment. Stricter alignments
+  // work for zero-initialized objects by over-allocating bss; the object
+  // lives at the rounded-up address, which is what every code reference
+  // computes (see gen_addr). Initialized data would need its image at a
+  // load-time-dependent offset, which MIR cannot express.
+  int32_t align = obj_align(var);
+  bool zero_init = !var->init_data ||
+                   (!var->rel && !memchr_inv_zero(var->init_data, size));
+  if (align > 16) {
+    if (!zero_init)
+      error("initialized object '%s' with alignment %d is not supported by the MIR backend "
+            "(only up to 16, or zero-initialized)", name, align);
+    MIR_new_bss(mc, name, size + align);
+    if (!var->is_static)
+      MIR_new_export(mc, name);
+    return;
+  }
+
   if (!var->init_data) {
     MIR_new_bss(mc, name, size);
     if (!var->is_static)
@@ -2055,10 +2090,16 @@ static void emit_data_obj(Obj *var) {
 
   // Resolve referenced symbols first: sym_item may create forward items,
   // and a non-data item interleaved between this object's chunks would
-  // split MIR's contiguous data section.
+  // split MIR's contiguous data section. The address a relocation stores
+  // is the item start, so references to over-aligned objects (whose code
+  // address is rounded up past that) cannot be expressed.
   for (Relocation *rel = var->rel; rel; rel = rel->next)
-    if (rel->var)
+    if (rel->var) {
+      if (obj_align(rel->var) > 16 && rel->var->ty->kind != TY_FUNC)
+        error("static initializer takes the address of over-aligned object '%s', "
+              "which is not supported by the MIR backend", sym_name(rel->var));
       sym_item(rel->var);
+    }
 
   // Emit the object as one named section followed by anonymous
   // continuation items; MIR lays consecutive anonymous items contiguously.
