@@ -1459,7 +1459,19 @@ static MIR_reg_t gen_expr(Node *node) {
   case ND_ALLOCA_ZINIT: {
     MIR_reg_t sz = gen_expr(node->m.lhs);
     MIR_reg_t r = new_tmp(MIR_T_I64);
-    out(MIR_new_insn(mc, MIR_ALLOCA, rop(r), rop(sz)));
+    // Over-aligned VLAs: over-allocate and round the pointer up. The
+    // rounded pointer lands in the variable's slot, so VLA deallocation
+    // restores to it; the sub-alignment padding stays allocated until an
+    // enclosing scope exits, which is harmless.
+    int32_t align = node->m.var ? obj_align(node->m.var) : 16;
+    if (align > 16) {
+      MIR_reg_t padded = i64_op2(MIR_ADD, sz, iop(align));
+      out(MIR_new_insn(mc, MIR_ALLOCA, rop(r), rop(padded)));
+      r = i64_op2(MIR_ADD, r, iop(align - 1));
+      r = i64_op2(MIR_AND, r, iop(-(int64_t)align));
+    } else {
+      out(MIR_new_insn(mc, MIR_ALLOCA, rop(r), rop(sz)));
+    }
     if (node->kind == ND_ALLOCA_ZINIT) {
       MIR_item_t ms = get_memset();
       MIR_reg_t res = new_tmp(MIR_T_I64);
