@@ -13,3 +13,4 @@
 /libslimcc.a
 /slimcc-mir-run
 **/*.lib.o
+/libslimcc-headers.inc
