@@ -672,7 +672,8 @@ Obj *new_lvar(Type *ty) {
 }
 
 static Obj *alloc_var(char *name, Type *ty) {
-  Obj *var = calloc(1, sizeof(Obj));
+  // Globals and parameters live as long as the types that reference them.
+  Obj *var = arena_calloc(&cc1_arena, sizeof(Obj));
   var->ty = ty;
   var->name = name;
   return var;
@@ -4932,7 +4933,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
         error_tok(tok, "enable MSVC anonymous struct extension with `-fms-anon-struct`");
       chk_mem_name(&names, basety->members);
 
-      Member *mem = calloc(1, sizeof(Member));
+      Member *mem = arena_calloc(&cc1_arena, sizeof(Member));
       mem->ty = basety;
 
       tok = tok->next;
@@ -4944,7 +4945,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
     // Regular struct members
     bool first = true;
     for (; comma_list(&tok, &tok, TK_SEMI, !first); first = false) {
-      Member *mem = calloc(1, sizeof(Member));
+      Member *mem = arena_calloc(&cc1_arena, sizeof(Member));
       mem->ty = declarator(&tok, tok, basety, &mem->name);
       if (mem->name) {
         chk_mem_name2(&names, mem->name);
@@ -6202,14 +6203,14 @@ static Token *free_parsed_tok(Token *tok, Token *end) {
       while (t2) {
         Token *tmp = t2;
         t2 = t2->next;
-        free(tmp);
+        tok_free(tmp);
       }
     }
     Token *tmp = tok;
     tok = tok->next;
 
     if (!tmp->is_live)
-      free(tmp);
+      tok_free(tmp);
   }
   return end;
 }
@@ -6281,6 +6282,13 @@ Obj *parse(Token *tok) {
 void parse_reset(void) {
   static Obj globals_init;
   static Scope scope_init;
+  // Free the file scope's heap-allocated symbol maps. After an error
+  // unwind `scope` may be a nested scope in the recycled AST arena, in
+  // which case nothing can be safely touched.
+  if (scope == &scope_init) {
+    free(scope->vars.buckets);
+    free(scope->tags.buckets);
+  }
   globals_init = (Obj){0};
   scope_init = (Scope){0};
   globals = &globals_init;

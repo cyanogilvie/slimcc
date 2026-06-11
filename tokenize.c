@@ -34,6 +34,47 @@ FILE *slimcc_diag_file;
 
 #define errf() (slimcc_diag_file ? slimcc_diag_file : stderr)
 
+// In library mode tokens come from a pool released wholesale between
+// compilations: token ownership is split between the allocation chain,
+// the freelist, and the surviving stream, so individual frees cannot
+// reclaim everything. EAGER_FREE builds keep real malloc/free.
+bool slimcc_lib_mode;
+
+#define TOK_POOL_LEN 1024
+
+static struct {
+  Token **blocks;
+  int capacity;
+  int len;
+  int used; // tokens used in the newest block
+} tok_pool;
+
+static bool tok_pooled(void) {
+  return !EAGER_FREE && slimcc_lib_mode;
+}
+
+Token *tok_alloc(void) {
+  if (!tok_pooled())
+    return calloc(1, sizeof(Token));
+
+  if (!tok_pool.len || tok_pool.used == TOK_POOL_LEN) {
+    if (tok_pool.len >= tok_pool.capacity) {
+      tok_pool.capacity = tok_pool.capacity ? tok_pool.capacity * 2 : 16;
+      tok_pool.blocks = realloc(tok_pool.blocks, tok_pool.capacity * sizeof(Token *));
+    }
+    tok_pool.blocks[tok_pool.len++] = malloc(TOK_POOL_LEN * sizeof(Token));
+    tok_pool.used = 0;
+  }
+  Token *t = &tok_pool.blocks[tok_pool.len - 1][tok_pool.used++];
+  memset(t, 0, sizeof(Token));
+  return t;
+}
+
+void tok_free(Token *t) {
+  if (!tok_pooled())
+    free(t);
+}
+
 // Reports an error and exit.
 void error(const char *fmt, ...) {
   va_list ap;
@@ -186,7 +227,7 @@ static Token *new_token(TokenKind kind, const char *start, const char *end) {
     tok_freelist = tok->next;
     memset(tok, 0, sizeof(Token));
   } else {
-    tok = calloc(1, sizeof(Token));
+    tok = tok_alloc();
   }
   tok->kind = kind;
   tok->loc = start;
@@ -1262,15 +1303,40 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
 
 // In-memory files for library mode; consulted by name before the
 // filesystem. Contents are owned by the caller and must outlive all
-// compilations that use them.
+// compilations that use them; the name is copied.
 static HashMap vfiles;
 
 void slimcc_vfile_add(const char *name, const char *contents) {
-  hashmap_put(&vfiles, name, (void *)contents);
+  int len = strlen(name);
+  // Copy the name only on first registration; re-registering an existing
+  // name just swaps the contents.
+  if (!hashmap_get2(&vfiles, name, len)) {
+    hashmap_put2(&vfiles, strdup(name), len, (void *)contents);
+    return;
+  }
+  HashEntry *ent = hashmap_get_or_insert(&vfiles, name, len);
+  ent->val = (void *)contents;
 }
 
 const char *slimcc_vfile_get(const char *name) {
   return vfiles.buckets ? hashmap_get(&vfiles, name) : NULL;
+}
+
+// File contents buffers live for the whole compilation (tokens point into
+// them); library mode frees them in tokenize_reset.
+static struct {
+  char **data;
+  int capacity;
+  int len;
+} file_contents;
+
+static void track_file_contents(char *buf) {
+  if (file_contents.len >= file_contents.capacity) {
+    file_contents.capacity = file_contents.capacity ? file_contents.capacity * 2 : 32;
+    file_contents.data =
+      realloc(file_contents.data, file_contents.capacity * sizeof(char *));
+  }
+  file_contents.data[file_contents.len++] = buf;
 }
 
 Token *tokenize_file(const char *path, Token *tok, Token **end) {
@@ -1327,6 +1393,7 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
   SlashDelta dlt = {0};
   remove_backslash_newline(buf, &dlt);
 
+  track_file_contents(buf);
   return tokenize(new_file(path, buf), &dlt, end);
 }
 
@@ -1425,4 +1492,12 @@ void tokenize_reset(void) {
   at_bol = has_space = false;
   free(display_file_map.buckets);
   display_file_map = (HashMap){0};
+  for (int i = 0; i < file_contents.len; i++)
+    free(file_contents.data[i]);
+  free(file_contents.data);
+  memset(&file_contents, 0, sizeof(file_contents));
+  for (int i = 0; i < tok_pool.len; i++)
+    free(tok_pool.blocks[i]);
+  free(tok_pool.blocks);
+  memset(&tok_pool, 0, sizeof(tok_pool));
 }

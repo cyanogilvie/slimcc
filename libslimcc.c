@@ -159,6 +159,9 @@ static void reset_all(void) {
   preprocess_reset();
   parse_reset();
   type_reset();
+  free(include_paths.data);
+  free(iquote_paths.data);
+  free(display_files.data);
   include_paths = (StringArray){0};
   iquote_paths = (StringArray){0};
   display_files = (StringArray){0};
@@ -178,18 +181,34 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   if (errmsg)
     *errmsg = NULL;
 
+  slimcc_lib_mode = true;
   reset_all();
 
   diag_buf = NULL;
   slimcc_diag_file = open_memstream(&diag_buf, &diag_len);
 
-  // The whole pipeline, MIR build errors included, unwinds to here.
-  // The scratch context is deliberately leaked on failure: it may hold a
-  // half-built function/module that MIR_finish would refuse to clean up.
+  // The whole pipeline, MIR build errors included, unwinds to here. On
+  // failure the scratch context holds a half-built function/module; the
+  // staged teardown closes those before destroying it, tolerating MIR
+  // errors raised by the teardown itself (each re-entry advances a stage;
+  // if even MIR_finish fails the context is leaked rather than corrupted).
+  static volatile int fail_stage;
   MIR_context_t scratch = MIR_init();
   MIR_set_error_func(scratch, mir_error);
 
   if (setjmp(compile_jmp)) {
+    switch (fail_stage) {
+    case 0:
+      fail_stage = 1;
+      codegen_mir_abort(); /* may longjmp back here */
+      /* fallthrough */
+    case 1:
+      fail_stage = 2;
+      MIR_finish(scratch); /* may longjmp back here */
+      /* fallthrough */
+    default:
+      break;
+    }
     compile_active = false;
     arenas_off();
     fclose(slimcc_diag_file);
@@ -202,6 +221,7 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
     reset_all();
     return NULL;
   }
+  fail_stage = 0;
   compile_active = true;
 
   slimcc_vfile_add(name, source);
@@ -232,13 +252,13 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   codegen(prog, NULL);
 
   arena_off(&cc1_arena);
-  compile_active = false;
 
   MIR_module_t mod = codegen_mir_result();
   if (opt && opt->mir_dump)
     MIR_output_module(scratch, opt->mir_dump, mod);
   MIR_change_module_ctx(scratch, mod, ctx);
   MIR_finish(scratch);
+  compile_active = false;
 
   fclose(slimcc_diag_file);
   slimcc_diag_file = NULL;
