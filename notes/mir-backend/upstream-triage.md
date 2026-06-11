@@ -144,3 +144,27 @@ Alpine/musl once with patched driver tables, and the open-bug surface
 relevant to our use case is clear. Everything else open upstream is either
 c2mir-only, feature requests, platforms we don't target, or already fixed on
 master (verified by reproducer).
+
+## Status update (2026-06-11, same day)
+
+All three fixes implemented in the fork, each on a topic branch off
+upstream master with a regression test, all merged into `meson`:
+
+- **#423** → branch `fix-gvn-load-ext` + c-tests/mir/issue423.mir
+  (i32/u32/i8 store-forward cases; fails rc=1 pre-fix, passes O0-O3
+  post-fix; the original C repro now prints -273 at -O3).
+- **#424** → branch `fix-jump-opt-lref-labels` + c-tests/mir/issue424.mir
+  (label-only BB referenced only via lref; pre-fix the merged label
+  produced a garbage table and the test looped forever, post-fix passes
+  O0-O3).
+- **`% 16`** → branch `fix-aarch64-ld-stack-align` +
+  c-tests/new/va-ld-stack.c. Pre-fix on real aarch64 (c8g):
+  **SIGSEGV in both -eg and -ei** — any binary128 long double vararg
+  taken from the stack crashed, worse than triaged. Post-fix passes.
+- **PR #420** cherry-picked onto `meson` with `-x` (authorship preserved).
+
+Validation: full upstream `make test` green on x86_64 (incl. all
+bootstraps); c-tests gen suite 1072/1072 on each topic branch; slimcc
+suite 95/103 on x86_64 (baseline, the 8 by-design rejections);
+aarch64 suite run pending/green per session log. #383
+(MIR_get_global_item definition) deferred — take when first needed.
