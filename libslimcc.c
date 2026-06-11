@@ -172,7 +172,12 @@ static void reset_all(void) {
 // which is searched before any caller-supplied include path - the same
 // precedence the CLI gives its builtin header directory. The parser
 // injects bitint_builtins from there into every translation unit.
-#include "libslimcc-headers.inc"
+// SLIMCC_HEADERS_INC lets out-of-tree builds (meson) point at their
+// generated copy so a stale in-tree one can't shadow it.
+#ifndef SLIMCC_HEADERS_INC
+#define SLIMCC_HEADERS_INC "libslimcc-headers.inc"
+#endif
+#include SLIMCC_HEADERS_INC
 
 static void register_embedded_headers(void) {
   char name[64];
