@@ -220,8 +220,14 @@ targets. `support-musl-std-libs` filed upstream as **PR #435** (fixes #307).
   `c2mir-bb-bootstrap-test`, which the kernel OOM-killed at 1.78GB anon-RSS
   / 4.4GB total-vm even with swap — the `-p4` parallel lazy-bb self-compile
   needs >2GB on musl (glibc fits in the same RAM; musl mallocng peak is
-  higher). The lazy-bb *mode* itself is green in c-tests gen-bb; the
-  sequential (-p1) bootstrap result is recorded below.
+  higher). The lazy-bb *mode* itself is green in c-tests gen-bb. A sequential
+  (-p1) retry died at the *same* numbers (anon-rss 1.78GB, total-vm
+  4.47GB, swap untouched, swappiness 60) — the memory is one compilation
+  context, not parallel workers: c2m's lazy-bb self-compile peaks ~2.5x
+  higher under musl mallocng than glibc for the identical workload
+  (compare upstream #411, "C2MIR high memory usage"). A c2mir-on-musl
+  characteristic, not a codegen issue, and c2mir is not in our production
+  path; run that one target on a >=4GB box if ever needed.
 
 Validation: full upstream `make test` green on x86_64 (incl. all
 bootstraps); c-tests gen suite 1072/1072 on each topic branch; slimcc
