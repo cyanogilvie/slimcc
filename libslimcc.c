@@ -167,6 +167,22 @@ static void reset_all(void) {
   display_files = (StringArray){0};
 }
 
+// The compiler's own headers (stdarg.h, stdatomic.h, bitint_builtins,
+// ...) travel inside the library as virtual files under "<slimcc>",
+// which is searched before any caller-supplied include path - the same
+// precedence the CLI gives its builtin header directory. The parser
+// injects bitint_builtins from there into every translation unit.
+#include "libslimcc-headers.inc"
+
+static void register_embedded_headers(void) {
+  char name[64];
+  for (size_t i = 0; i < sizeof(embedded_headers) / sizeof(*embedded_headers); i++) {
+    snprintf(name, sizeof(name), "<slimcc>/%s", embedded_headers[i].name);
+    slimcc_vfile_add(name, embedded_headers[i].contents);
+  }
+  add_include_path(&include_paths, "<slimcc>");
+}
+
 static void arenas_off(void) {
   if (ast_arena.cur)
     arena_off(&ast_arena);
@@ -225,6 +241,7 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   compile_active = true;
 
   slimcc_vfile_add(name, source);
+  register_embedded_headers();
   if (opt) {
     for (int i = 0; i < opt->n_vfiles; i++)
       slimcc_vfile_add(opt->vfiles[i].name, opt->vfiles[i].contents);

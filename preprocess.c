@@ -146,6 +146,12 @@ static Token *new_pmark(Token *tok) {
 }
 
 static void get_realpath(const char *path, char *buf) {
+  // Virtual file names are canonical already.
+  if (slimcc_vfile_get(path)) {
+    if (PATH_MAX <= snprintf(buf, PATH_MAX, "%s", path))
+      internal_error();
+    return;
+  }
   if (!realpath(path, buf))
     error("failed to resolve realpath of %s: %s", path, strerror(errno));
 }

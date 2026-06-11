@@ -141,7 +141,20 @@ LIB_CFLAGS=-I. -I$(MIR_DIR) -fPIC
 .c.lib.o:
 	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c $<
 
+# Builtin headers embedded into the library, so compiles work with no
+# filesystem access (the parser injects bitint_builtins into every TU).
+libslimcc-headers.inc: $(sort $(wildcard slimcc_headers/include/*))
+	{ echo '// Generated from slimcc_headers/include - do not edit.'; \
+	  echo 'static const struct { const char *name; const char *contents; } embedded_headers[] = {'; \
+	  for f in $^; do \
+	    printf '{"%s",\n' "$$(basename $$f)"; \
+	    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' "$$f"; \
+	    echo '},'; \
+	  done; \
+	  echo '};'; } > $@
+
 codegen-mir.lib.o libslimcc.lib.o: codegen-mir.h libslimcc.h
+libslimcc.lib.o: libslimcc-headers.inc
 
 platform-mir.lib.o: platform/mir.c slimcc.h
 	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c platform/mir.c
@@ -155,6 +168,6 @@ slimcc-mir-run: mir-run.c libslimcc.a $(MIR_DIR)/libmir.a
 	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ mir-run.c libslimcc.a $(MIR_DIR)/libmir.a -lm -ldl
 
 clean-lib:
-	rm -f libslimcc.a slimcc-mir-run *.lib.o
+	rm -f libslimcc.a slimcc-mir-run *.lib.o libslimcc-headers.inc
 
 .PHONY: clean-lib
