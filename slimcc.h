@@ -459,6 +459,9 @@ void convert_ucn_ident(Token *tok);
 
 // Library (JIT) mode support
 extern FILE *slimcc_diag_file;
+extern bool slimcc_lib_mode;
+Token *tok_alloc(void);
+void tok_free(Token *t);
 void slimcc_vfile_add(const char *name, const char *contents);
 const char *slimcc_vfile_get(const char *name);
 void tokenize_reset(void);

@@ -88,7 +88,7 @@ static Token *get_line(Token **cur, Token *tok) {
      Token *y = last->next;       \
      for (; x != y;) {            \
        Token *nxt = x->next;      \
-       free(x);                   \
+       tok_free(x);               \
        x = nxt;                   \
      }                            \
    } while (0)
@@ -105,7 +105,7 @@ static Token *copy_token(Token *tok) {
   if ((t = tok_freelist))
     tok_freelist = t->next;
   else
-    t = malloc(sizeof(Token));
+    t = tok_alloc();
 
   *t = *tok;
   t->alloc_next = last_alloc_tok;
@@ -2172,7 +2172,7 @@ Token *prepare_parse(Token *tok) {
     t = t->alloc_next;
 
     if (!tmp->is_root)
-      free(tmp);
+      tok_free(tmp);
   }
 
   tok = preprocess3(tok);
@@ -2180,7 +2180,7 @@ Token *prepare_parse(Token *tok) {
   for (t = tok_freelist; t;) {
     Token *tmp = t;
     t = t->next;
-    free(tmp);
+    tok_free(tmp);
   }
 
   free(macros.buckets);

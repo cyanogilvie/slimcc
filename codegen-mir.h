@@ -11,4 +11,9 @@ void codegen_mir_begin(MIR_context_t ctx, const char *module_name);
 // The module finished by codegen(), or NULL if compilation did not finish.
 MIR_module_t codegen_mir_result(void);
 
+// Close any function/module left open by an error unwind so the scratch
+// context can be destroyed. The MIR calls involved may themselves raise
+// MIR errors; the caller's error handler must tolerate re-entry.
+void codegen_mir_abort(void);
+
 #endif

@@ -1760,3 +1760,20 @@ void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {
 MIR_module_t codegen_mir_result(void) {
   return result_mod;
 }
+
+void codegen_mir_abort(void) {
+  if (!mc)
+    return;
+  // Clear our state first so a re-entered abort skips the failing step.
+  MIR_item_t item = fn_item;
+  MIR_module_t mod = cur_mod;
+  fn_item = NULL;
+  fn_func = NULL;
+  cur_fn = NULL;
+  cur_mod = NULL;
+  if (item)
+    MIR_finish_func(mc);
+  if (mod)
+    MIR_finish_module(mc);
+  mc = NULL;
+}
