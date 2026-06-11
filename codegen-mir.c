@@ -48,6 +48,22 @@ static void gen_stmt(Node *node);
 static void gen_cond(Node *node, bool jump_on_true, MIR_label_t lab);
 static void emit_data_obj(Obj *var);
 static MIR_reg_t i64_op2(MIR_insn_code_t code, MIR_reg_t a, MIR_op_t b);
+typedef enum {
+  BI_NEG, BI_BITNOT, BI_BITAND, BI_BITOR, BI_BITXOR,
+  BI_ADD, BI_SUB, BI_MUL, BI_DIV, BI_SHL, BI_SHR,
+  BI_CMP, BI_TO_BOOL, BI_SIGN_EXT, BI_OVERFLOW, BI_BF_LOAD, BI_BF_SAVE,
+  BI_CNT
+} BitintHelper;
+
+static void gen_mem_copy(MIR_reg_t dst, MIR_reg_t src, int64_t size);
+static bool is_big_bitint(Type *ty);
+static MIR_reg_t bitint_buf(int64_t size);
+static MIR_reg_t bitint_copy(Type *ty, MIR_reg_t src);
+static MIR_reg_t bitint_norm(MIR_reg_t r, Type *ty);
+static MIR_reg_t bitint_call(BitintHelper h, int nargs, MIR_op_t *args);
+static MIR_reg_t bitint_to_bool(Type *ty, MIR_reg_t addr);
+static MIR_reg_t load_bitint_bitfield(Member *mem, MIR_reg_t addr);
+static MIR_reg_t store_bitint_bitfield(Member *mem, MIR_reg_t addr, MIR_reg_t val);
 
 // Whether a function definition is externally visible (mirrors codegen.c's
 // export_fn). Inline definitions that are not externally visible stay as
@@ -69,9 +85,10 @@ int64_t align_to(int64_t n, int64_t align) {
 }
 
 bool va_arg_need_copy(Type *ty) {
-  // Aggregates fetched with va_arg go through a buffer the parser
-  // allocates; MIR_VA_BLOCK_ARG fills it directly.
-  return ty->kind == TY_STRUCT || ty->kind == TY_UNION;
+  // Aggregates and big bitints fetched with va_arg go through a buffer
+  // the parser allocates; MIR_VA_BLOCK_ARG fills it directly.
+  return ty->kind == TY_STRUCT || ty->kind == TY_UNION ||
+         (ty->kind == TY_BITINT && ty->bit_cnt > 64);
 }
 
 bool bitint_rtn_need_copy(size_t width) {
@@ -260,7 +277,8 @@ static MIR_op_t mem_op(Type *ty, MIR_reg_t base, int64_t disp) {
 
 // Load a scalar of type ty from the address in base. Aggregates, arrays
 // and functions are represented by their address, which callers pass
-// through without calling this.
+// through without calling this. Small-bitint memory may be non-canonical
+// (stores write raw 2^64-wrapped results), so every load re-extends.
 static MIR_reg_t load_scalar(Type *ty, MIR_reg_t base, int64_t disp) {
   MIR_type_t cls = mir_class(ty);
   MIR_reg_t r = new_tmp(cls);
@@ -269,7 +287,7 @@ static MIR_reg_t load_scalar(Type *ty, MIR_reg_t base, int64_t disp) {
                         : cls == MIR_T_LD ? MIR_LDMOV
                                           : MIR_MOV;
   out(MIR_new_insn(mc, mov, rop(r), mem_op(ty, base, disp)));
-  return r;
+  return bitint_norm(r, ty);
 }
 
 static void store_scalar(Type *ty, MIR_reg_t base, int64_t disp, MIR_reg_t val) {
@@ -323,7 +341,7 @@ static MIR_reg_t extract_field(MIR_reg_t val, int width, bool is_unsigned) {
 
 static MIR_reg_t load_bitfield(Member *mem, MIR_reg_t addr) {
   if (mem->ty->kind == TY_BITINT)
-    error("_BitInt bitfields are not yet supported by the MIR backend");
+    return load_bitint_bitfield(mem, addr);
 
   int w = mem->bit_width, o = mem->bit_offset;
 
@@ -361,7 +379,7 @@ static MIR_reg_t load_bitfield(Member *mem, MIR_reg_t addr) {
 // assignment expression (the field's new contents, extended).
 static MIR_reg_t store_bitfield(Member *mem, MIR_reg_t addr, MIR_reg_t val) {
   if (mem->ty->kind == TY_BITINT)
-    error("_BitInt bitfields are not yet supported by the MIR backend");
+    return store_bitint_bitfield(mem, addr, val);
 
   int w = mem->bit_width, o = mem->bit_offset;
 
@@ -434,9 +452,42 @@ static MIR_reg_t int_extend(MIR_reg_t src, Type *ty) {
   return r;
 }
 
-static MIR_reg_t gen_cast2(MIR_reg_t src, Type *from, Type *to) {
+static MIR_reg_t gen_cast2(MIR_reg_t src, Type *from, Type *to, Token *tok) {
   if (to->kind == TY_VOID)
     return src;
+
+  if (is_big_bitint(to)) {
+    if (is_big_bitint(from)) {
+      // Truncation reads the low chunks in place; widening re-extends a
+      // copy in a buffer of the wider size.
+      if (from->bit_cnt >= to->bit_cnt)
+        return src;
+      MIR_reg_t buf = bitint_buf(to->size);
+      gen_mem_copy(buf, src, from->size);
+      bitint_call(BI_SIGN_EXT, 4, (MIR_op_t[]){iop(from->bit_cnt), rop(buf), iop(to->bit_cnt),
+                                               iop(from->is_unsigned)});
+      return buf;
+    }
+    if (is_scalar_fp(from))
+      error_tok(tok, "Unimplemented cast to _BitInt");
+    MIR_reg_t buf = bitint_buf(to->size);
+    out(MIR_new_insn(mc, MIR_MOV, MIR_new_mem_op(mc, MIR_T_I64, 0, buf, 0, 1), rop(src)));
+    bitint_call(BI_SIGN_EXT, 4, (MIR_op_t[]){iop(bit_size(from)), rop(buf), iop(to->bit_cnt),
+                                             iop(from->is_unsigned)});
+    return buf;
+  }
+
+  if (is_big_bitint(from)) {
+    if (to->kind == TY_BOOL)
+      return bitint_to_bool(from, src);
+    if (is_scalar_fp(to))
+      error_tok(tok, "Unimplemented cast from _BitInt");
+    // The low chunk, normalized to the target's representation.
+    MIR_reg_t r = load_scalar(ty_llong, src, 0);
+    if (to->kind == TY_BITINT)
+      return bitint_norm(r, to);
+    return (is_integer(to) && to->size < 8) ? int_extend(r, to) : r;
+  }
 
   if (to->kind == TY_BOOL) {
     MIR_reg_t r = new_tmp(MIR_T_I64);
@@ -454,8 +505,15 @@ static MIR_reg_t gen_cast2(MIR_reg_t src, Type *from, Type *to) {
 
   if (!from_fp && !to_fp) {
     // Integer/pointer to integer/pointer: normalize to the target width.
+    if (to->kind == TY_BITINT) {
+      if (to->bit_cnt != to->size * 8)
+        return bitint_norm(src, to);
+      return to->size < 8 ? int_extend(src, to) : src;
+    }
     if (is_integer(to) && to->size < 8)
       return int_extend(src, to);
+    if (from->kind == TY_BITINT)
+      return src; // already canonical
     if (is_integer(from) && from->size < 8 && from->size < to->size)
       return int_extend(src, from);
     return src;
@@ -501,6 +559,8 @@ static MIR_reg_t gen_cast2(MIR_reg_t src, Type *from, Type *to) {
   }
   MIR_reg_t r = new_tmp(MIR_T_I64);
   out(MIR_new_insn(mc, code, rop(r), rop(src)));
+  if (to->kind == TY_BITINT)
+    return bitint_norm(to->size < 8 ? int_extend(r, to) : r, to);
   if (is_integer(to) && to->size < 8)
     return int_extend(r, to);
   return r;
@@ -753,6 +813,263 @@ static void gen_mem_copy(MIR_reg_t dst, MIR_reg_t src, int64_t size) {
                                     rop(res), rop(dst), rop(src), iop(size)}));
 }
 
+//
+// _BitInt wider than 64 bits ("big"): the value is the address of a
+// little-endian 64-bit-chunk buffer, and all operations go through the
+// __slimcc_bitint_* helpers from the injected bitint_builtins header,
+// which this backend compiles into every module like any other function
+// (mirrors codegen.c's lowering). Helper convention: lh/src operands are
+// read-only and results land in rh/dst, except that div clobbers both
+// and to_bool canonicalizes its operand in place — operands that alias
+// program memory are copied into fresh buffers accordingly.
+//
+// _BitInt up to 64 bits stays in registers like other integers, kept
+// canonical: sign/zero-extended from bit_cnt, maintained by bitint_norm
+// at every value-producing site.
+//
+
+static bool is_big_bitint(Type *ty) {
+  return ty->kind == TY_BITINT && ty->bit_cnt > 64;
+}
+
+// Values of these types are represented by their address.
+static bool is_addr_value(Type *ty) {
+  return is_aggregate(ty) || is_big_bitint(ty);
+}
+
+// A fresh buffer as a function-entry alloca: executes once even inside
+// loops, and lands before the BSTART that VLA deallocation restores to.
+static MIR_reg_t bitint_buf(int64_t size) {
+  MIR_reg_t r = new_tmp(MIR_T_I64);
+  MIR_prepend_insn(mc, fn_item,
+                   MIR_new_insn(mc, MIR_ALLOCA, rop(r), iop(align_to(MAX(size, 8), 16))));
+  return r;
+}
+
+static MIR_reg_t bitint_copy(Type *ty, MIR_reg_t src) {
+  MIR_reg_t buf = bitint_buf(ty->size);
+  gen_mem_copy(buf, src, ty->size);
+  return buf;
+}
+
+// Re-extend a small-bitint register value from bit_cnt (no-op for other
+// types and for widths the size-based extension already covers).
+static MIR_reg_t bitint_norm(MIR_reg_t r, Type *ty) {
+  if (ty->kind != TY_BITINT || ty->bit_cnt > 64 || ty->bit_cnt == ty->size * 8)
+    return r;
+  MIR_reg_t t = i64_op2(MIR_LSH, r, iop(64 - ty->bit_cnt));
+  return i64_op2(ty->is_unsigned ? MIR_URSH : MIR_RSH, t, iop(64 - ty->bit_cnt));
+}
+
+// Signatures match the helper definitions: 'i' int, 'p' pointer, 'b' bool.
+static const struct {
+  const char *name;
+  char res; // 0 for void
+  const char *args;
+} bitint_fns[BI_CNT] = {
+  [BI_NEG] = {"__slimcc_bitint_neg", 0, "ip"},
+  [BI_BITNOT] = {"__slimcc_bitint_bitnot", 0, "ip"},
+  [BI_BITAND] = {"__slimcc_bitint_bitand", 0, "ipp"},
+  [BI_BITOR] = {"__slimcc_bitint_bitor", 0, "ipp"},
+  [BI_BITXOR] = {"__slimcc_bitint_bitxor", 0, "ipp"},
+  [BI_ADD] = {"__slimcc_bitint_add", 0, "ipp"},
+  [BI_SUB] = {"__slimcc_bitint_sub", 0, "ipp"},
+  [BI_MUL] = {"__slimcc_bitint_mul", 0, "ipp"},
+  [BI_DIV] = {"__slimcc_bitint_div", 0, "ippbb"},
+  [BI_SHL] = {"__slimcc_bitint_shl", 0, "ippi"},
+  [BI_SHR] = {"__slimcc_bitint_shr", 0, "ippib"},
+  [BI_CMP] = {"__slimcc_bitint_cmp", 'i', "ippb"},
+  [BI_TO_BOOL] = {"__slimcc_bitint_to_bool", 'b', "ip"},
+  [BI_SIGN_EXT] = {"__slimcc_bitint_sign_ext", 0, "ipib"},
+  [BI_OVERFLOW] = {"__slimcc_bitint_overflow", 'b', "ipib"},
+  [BI_BF_LOAD] = {"__slimcc_bitint_bitfield_load", 'p', "ippiib"},
+  [BI_BF_SAVE] = {"__slimcc_bitint_bitfield_save", 0, "ippii"},
+};
+
+static MIR_item_t bitint_items[BI_CNT], bitint_protos[BI_CNT];
+
+static MIR_type_t bitint_arg_type(char c) {
+  switch (c) {
+  case 'i': return MIR_T_I32;
+  case 'b': return MIR_T_U8;
+  default: return MIR_T_I64;
+  }
+}
+
+static MIR_item_t get_bitint_fn(BitintHelper h, MIR_item_t *proto) {
+  if (!bitint_items[h]) {
+    const char *name = bitint_fns[h].name;
+    if (!get_symbol_var(name))
+      error("missing builtin function %s", name);
+    SymItem *si = sym_entry(name);
+    if (!si->item)
+      si->item = MIR_new_forward(mc, si->key);
+    bitint_items[h] = si->item;
+
+    static const char *const argnames[6] = {"a0", "a1", "a2", "a3", "a4", "a5"};
+    MIR_var_t vars[6];
+    int n = strlen(bitint_fns[h].args);
+    for (int i = 0; i < n; i++) {
+      vars[i].type = bitint_arg_type(bitint_fns[h].args[i]);
+      vars[i].name = argnames[i];
+      vars[i].size = 0;
+    }
+    size_t nres = bitint_fns[h].res != 0;
+    MIR_type_t res_ty = nres ? bitint_arg_type(bitint_fns[h].res) : MIR_T_UNDEF;
+    char pname[48];
+    snprintf(pname, sizeof(pname), "%s.p", name);
+    bitint_protos[h] = MIR_new_proto_arr(mc, pname, nres, &res_ty, n, vars);
+  }
+  *proto = bitint_protos[h];
+  return bitint_items[h];
+}
+
+// Returns the result register (0 for void helpers).
+static MIR_reg_t bitint_call(BitintHelper h, int nargs, MIR_op_t *args) {
+  MIR_item_t proto;
+  MIR_item_t fn = get_bitint_fn(h, &proto);
+  MIR_op_t ops[9];
+  ops[0] = MIR_new_ref_op(mc, proto);
+  ops[1] = MIR_new_ref_op(mc, fn);
+  int i = 2;
+  MIR_reg_t res = 0;
+  if (bitint_fns[h].res) {
+    res = new_tmp(MIR_T_I64);
+    ops[i++] = rop(res);
+  }
+  for (int a = 0; a < nargs; a++)
+    ops[i++] = args[a];
+  out(MIR_new_insn_arr(mc, MIR_CALL, i, ops));
+  return res;
+}
+
+// Truth value of a big-bitint value (copied first: to_bool canonicalizes
+// its operand in place).
+static MIR_reg_t bitint_to_bool(Type *ty, MIR_reg_t addr) {
+  MIR_reg_t buf = bitint_copy(ty, addr);
+  return bitint_call(BI_TO_BOOL, 2, (MIR_op_t[]){iop(ty->bit_cnt), rop(buf)});
+}
+
+// Binary arithmetic on big-bitint operands. Both sides are copied: the
+// copy of lhs shields it from side effects of evaluating rhs (and div
+// clobbers it); rhs is the buffer the result lands in.
+static MIR_reg_t gen_bitint_arith(Node *node) {
+  Type *ty = node->ty;
+  MIR_op_t bits = iop(ty->bit_cnt);
+  MIR_reg_t lhs = bitint_copy(ty, gen_expr(node->m.lhs));
+
+  switch (node->kind) {
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR: {
+    MIR_reg_t amount = gen_expr(node->m.rhs);
+    MIR_reg_t dst = bitint_buf(ty->size);
+    if (node->kind == ND_SHL)
+      bitint_call(BI_SHL, 4, (MIR_op_t[]){bits, rop(lhs), rop(dst), rop(amount)});
+    else
+      bitint_call(BI_SHR, 5,
+                  (MIR_op_t[]){bits, rop(lhs), rop(dst), rop(amount), iop(ty->is_unsigned)});
+    return dst;
+  }
+  }
+
+  MIR_reg_t rhs = bitint_copy(ty, gen_expr(node->m.rhs));
+  switch (node->kind) {
+  case ND_BITAND: bitint_call(BI_BITAND, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
+  case ND_BITOR: bitint_call(BI_BITOR, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
+  case ND_BITXOR: bitint_call(BI_BITXOR, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
+  case ND_ADD: bitint_call(BI_ADD, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
+  case ND_SUB: bitint_call(BI_SUB, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
+  case ND_MUL: bitint_call(BI_MUL, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
+  case ND_DIV:
+  case ND_MOD:
+    bitint_call(BI_DIV, 5, (MIR_op_t[]){bits, rop(lhs), rop(rhs), iop(ty->is_unsigned),
+                                        iop(node->kind == ND_DIV)});
+    break;
+  default:
+    internal_error();
+  }
+  return rhs;
+}
+
+// Comparison of big-bitint operands via __slimcc_bitint_cmp, which
+// returns 0 (equal), 1 (lh < rh) or 2 (lh > rh) and reads both buffers
+// without mutating; lhs is still copied against rhs side effects.
+static MIR_reg_t gen_bitint_cmp(Node *node) {
+  Type *ty = node->m.lhs->ty;
+  MIR_reg_t lhs = bitint_copy(ty, gen_expr(node->m.lhs));
+  MIR_reg_t rhs = gen_expr(node->m.rhs);
+  MIR_reg_t c = bitint_call(
+      BI_CMP, 4, (MIR_op_t[]){iop(ty->bit_cnt), rop(lhs), rop(rhs), iop(ty->is_unsigned)});
+
+  static const int cmp_val[6] = {0, 0, 1, 2, 2, 1};   // EQ NE LT LE GT GE
+  static const bool cmp_eq[6] = {true, false, true, false, true, false};
+  int idx = node->kind - ND_EQ;
+  MIR_reg_t r = new_tmp(MIR_T_I64);
+  out(MIR_new_insn(mc, cmp_eq[idx] ? MIR_EQ : MIR_NE, rop(r), rop(c), iop(cmp_val[idx])));
+  return r;
+}
+
+static int32_t ovf_headroom(Type *ty, NodeKind kind) {
+  int32_t bits = (ty->kind == TY_BOOL) ? 1 : bit_size(ty);
+
+  if (kind == ND_MUL)
+    return bits * 2 + ty->is_unsigned;
+  return bits + 1 + ty->is_unsigned;
+}
+
+// Evaluate a checked-arithmetic operand cast to _BitInt(bits) into a
+// fresh buffer (bits is a multiple of 64; the 64-bit case is a register
+// value spilled into the buffer).
+static MIR_reg_t gen_ckd_operand(Node *operand, Type *bty) {
+  Node expr = *operand;
+  MIR_reg_t v = gen_expr(new_cast(&expr, bty));
+  if (bty->bit_cnt > 64)
+    return bitint_copy(bty, v);
+  MIR_reg_t buf = bitint_buf(8);
+  out(MIR_new_insn(mc, MIR_MOV, MIR_new_mem_op(mc, MIR_T_I64, 0, buf, 0, 1), rop(v)));
+  return buf;
+}
+
+// _BitInt bitfields of any width go through the bitfield helpers, which
+// work on whole-chunk buffers (mirrors codegen.c's gen_bitfield_load).
+static MIR_reg_t load_bitint_bitfield(Member *mem, MIR_reg_t addr) {
+  Type *ty = mem->ty;
+  MIR_reg_t buf = bitint_buf(ty->size);
+  bitint_call(BI_BF_LOAD, 6,
+              (MIR_op_t[]){iop(ty->bit_cnt), rop(addr), rop(buf), iop(mem->bit_width),
+                           iop(mem->bit_offset), iop(ty->is_unsigned)});
+  if (ty->bit_cnt > 64)
+    return buf;
+  return load_scalar(ty, buf, 0);
+}
+
+static MIR_reg_t store_bitint_bitfield(Member *mem, MIR_reg_t addr, MIR_reg_t val) {
+  Type *ty = mem->ty;
+
+  // The helper reads the value buffer without mutating, so a big value's
+  // address is passed as-is; register values are spilled to a buffer.
+  MIR_reg_t vbuf;
+  if (ty->bit_cnt > 64) {
+    vbuf = val;
+  } else {
+    vbuf = bitint_buf(8);
+    out(MIR_new_insn(mc, MIR_MOV, MIR_new_mem_op(mc, MIR_T_I64, 0, vbuf, 0, 1), rop(val)));
+  }
+  bitint_call(BI_BF_SAVE, 5, (MIR_op_t[]){iop(ty->bit_cnt), rop(vbuf), rop(addr),
+                                          iop(mem->bit_width), iop(mem->bit_offset)});
+
+  // The assignment expression's value: the stored field re-extended from
+  // its width to the full type.
+  if (ty->bit_cnt > 64) {
+    MIR_reg_t res = bitint_copy(ty, vbuf);
+    bitint_call(BI_SIGN_EXT, 4, (MIR_op_t[]){iop(mem->bit_width), rop(res), iop(ty->bit_cnt),
+                                             iop(ty->is_unsigned)});
+    return res;
+  }
+  return extract_field(val, mem->bit_width, ty->is_unsigned);
+}
+
 static MIR_reg_t gen_funcall(Node *node) {
   Node *fn_expr = node->call.expr;
   Type *fn_ty = fn_expr->ty;
@@ -762,12 +1079,10 @@ static MIR_reg_t gen_funcall(Node *node) {
     internal_error();
 
   Type *rt = node->ty;
-  if (rt->kind == TY_BITINT && rt->bit_cnt > 64)
-    error_tok(node->tok, "_BitInt wider than 64 bits is not yet supported by the MIR backend");
 
-  // Struct returns go through the parser-allocated buffer, passed as a
-  // hidden first RBLK argument.
-  bool rtn_by_addr = rt->kind == TY_STRUCT || rt->kind == TY_UNION;
+  // Struct and big-bitint returns go through the parser-allocated buffer,
+  // passed as a hidden first RBLK argument.
+  bool rtn_by_addr = rt->kind == TY_STRUCT || rt->kind == TY_UNION || is_big_bitint(rt);
   if (rtn_by_addr && !node->call.rtn_buf)
     internal_error();
 
@@ -798,10 +1113,8 @@ static MIR_reg_t gen_funcall(Node *node) {
   // Evaluate arguments left to right.
   for (Obj *arg = node->call.args; arg; arg = arg->param_next, i++) {
     Type *ty = arg->ty;
-    if (ty->kind == TY_BITINT && ty->bit_cnt > 64)
-      error_tok(node->tok, "_BitInt wider than 64 bits is not yet supported by the MIR backend");
     vars[i].name = arena_format(&cc1_arena, "a%d", i);
-    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION || is_big_bitint(ty)) {
       // Aggregate values are their address; MIR copies the block per the
       // target convention. The mem op's disp field carries the size.
       vars[i].type = MIR_T_BLK;
@@ -841,6 +1154,8 @@ static MIR_reg_t gen_funcall(Node *node) {
   if (rtn_by_addr)
     return local_addr(node->call.rtn_buf);
   // Small integer returns: normalize to the extended representation.
+  if (nres && rt->kind == TY_BITINT)
+    return bitint_norm(rt->size < 8 ? int_extend(res, rt) : res, rt);
   if (nres && is_integer(rt) && rt->size < 8)
     return int_extend(res, rt);
   return res;
@@ -880,7 +1195,7 @@ static MIR_reg_t gen_addr(Node *node) {
   case ND_COND:
   case ND_STMT_EXPR:
   case ND_FUNCALL:
-    if (is_aggregate(node->ty) || node->kind == ND_STMT_EXPR)
+    if (is_addr_value(node->ty) || node->kind == ND_STMT_EXPR)
       return gen_expr(node);
     break;
   case ND_CAST:
@@ -896,10 +1211,8 @@ static MIR_reg_t load_node(Node *node, MIR_reg_t addr) {
   Type *ty = node->ty;
   if (node->kind == ND_MEMBER && node->m.member->is_bitfield)
     return load_bitfield(node->m.member, addr);
-  if (is_aggregate(ty) || ty->kind == TY_FUNC)
+  if (is_addr_value(ty) || ty->kind == TY_FUNC)
     return addr;
-  if (ty->kind == TY_BITINT && ty->bit_cnt > 64)
-    error_tok(node->tok, "_BitInt wider than 64 bits is not yet supported by the MIR backend");
   return load_scalar(ty, addr, 0);
 }
 
@@ -909,7 +1222,7 @@ static MIR_reg_t gen_store(Node *lhs, MIR_reg_t addr, MIR_reg_t val) {
   Type *ty = lhs->ty;
   if (lhs->kind == ND_MEMBER && lhs->m.member->is_bitfield)
     return store_bitfield(lhs->m.member, addr, val);
-  if (is_aggregate(ty)) {
+  if (is_addr_value(ty)) {
     gen_mem_copy(addr, val, ty->size);
     return val;
   }
@@ -929,6 +1242,12 @@ static MIR_reg_t gen_arith_assign(Node *node, bool want_old) {
   Node *lhs = node->m.lhs;
   MIR_reg_t addr = gen_addr(lhs);
   MIR_reg_t old = load_node(lhs, addr);
+
+  // A plain big-bitint lvalue's "value" is its storage address; the
+  // postfix result must be a snapshot taken before the store.
+  if (want_old && is_big_bitint(lhs->ty) &&
+      !(lhs->kind == ND_MEMBER && lhs->m.member->is_bitfield))
+    old = bitint_copy(lhs->ty, old);
 
   NodeKind kind = node->kind == ND_POST_INCDEC ? ND_ADD : node->arith_kind;
   Node null = {.kind = ND_NULL_EXPR, .ty = lhs->ty, .tok = node->tok};
@@ -952,8 +1271,23 @@ static MIR_reg_t gen_expr(Node *node) {
     return 0;
   case ND_NUM: {
     Type *ty = node->ty;
-    if (ty->kind == TY_BITINT && ty->bit_cnt > 64)
-      error_tok(node->tok, "_BitInt wider than 64 bits is not yet supported by the MIR backend");
+    // _BitInt literal values of any width live in num.bitint_data.
+    if (ty->kind == TY_BITINT) {
+      if (ty->bit_cnt > 64) {
+        MIR_reg_t buf = bitint_buf(ty->size);
+        for (int64_t i = 0; i < ty->size / 8; i++)
+          out(MIR_new_insn(mc, MIR_MOV, MIR_new_mem_op(mc, MIR_T_I64, i * 8, buf, 0, 1),
+                           iop((&node->num.bitint_data->as64)[i])));
+        return buf;
+      }
+      int64_t val = node->num.bitint_data->as64;
+      if (ty->bit_cnt < 64) { // canonicalize the immediate
+        val <<= 64 - ty->bit_cnt;
+        val = ty->is_unsigned ? (int64_t)((uint64_t)val >> (64 - ty->bit_cnt))
+                              : val >> (64 - ty->bit_cnt);
+      }
+      return new_i64(val);
+    }
     MIR_reg_t r = new_tmp(mir_class(ty));
     switch (ty->kind) {
     case TY_FLOAT:
@@ -973,6 +1307,11 @@ static MIR_reg_t gen_expr(Node *node) {
   case ND_POS:
     return gen_expr(node->m.lhs);
   case ND_NEG: {
+    if (is_big_bitint(node->ty)) {
+      MIR_reg_t buf = bitint_copy(node->ty, gen_expr(node->m.lhs));
+      bitint_call(BI_NEG, 2, (MIR_op_t[]){iop(node->ty->bit_cnt), rop(buf)});
+      return buf;
+    }
     MIR_reg_t v = gen_expr(node->m.lhs);
     MIR_reg_t r = new_tmp(mir_class(node->ty));
     MIR_insn_code_t code;
@@ -983,7 +1322,7 @@ static MIR_reg_t gen_expr(Node *node) {
     default: code = node->ty->size <= 4 ? MIR_NEGS : MIR_NEG;
     }
     out(MIR_new_insn(mc, code, rop(r), rop(v)));
-    return r;
+    return bitint_norm(r, node->ty);
   }
   case ND_VAR:
   case ND_MEMBER:
@@ -1020,7 +1359,7 @@ static MIR_reg_t gen_expr(Node *node) {
     gen_void_expr(node->m.lhs);
     return gen_expr(node->m.rhs);
   case ND_CAST:
-    return gen_cast2(gen_expr(node->m.lhs), node->m.lhs->ty, node->ty);
+    return gen_cast2(gen_expr(node->m.lhs), node->m.lhs->ty, node->ty, node->tok);
   case ND_INIT_SEQ: {
     gen_mem_zero(local_addr(node->m.var), node->m.var->ty->size);
     for (Node *n = node->m.lhs; n; n = n->next)
@@ -1053,6 +1392,12 @@ static MIR_reg_t gen_expr(Node *node) {
     return r;
   }
   case ND_NOT: {
+    if (is_big_bitint(node->m.lhs->ty)) {
+      MIR_reg_t b = bitint_to_bool(node->m.lhs->ty, gen_expr(node->m.lhs));
+      MIR_reg_t r = new_tmp(MIR_T_I64);
+      out(MIR_new_insn(mc, MIR_EQ, rop(r), rop(b), iop(0)));
+      return r;
+    }
     MIR_reg_t v = gen_expr(node->m.lhs);
     MIR_reg_t r = new_tmp(MIR_T_I64);
     switch (node->m.lhs->ty->kind) {
@@ -1064,10 +1409,15 @@ static MIR_reg_t gen_expr(Node *node) {
     return r;
   }
   case ND_BITNOT: {
+    if (is_big_bitint(node->ty)) {
+      MIR_reg_t buf = bitint_copy(node->ty, gen_expr(node->m.lhs));
+      bitint_call(BI_BITNOT, 2, (MIR_op_t[]){iop(node->ty->bit_cnt), rop(buf)});
+      return buf;
+    }
     MIR_reg_t v = gen_expr(node->m.lhs);
     MIR_reg_t r = new_tmp(MIR_T_I64);
     out(MIR_new_insn(mc, node->ty->size <= 4 ? MIR_XORS : MIR_XOR, rop(r), rop(v), iop(-1)));
-    return r;
+    return bitint_norm(r, node->ty);
   }
   case ND_LOGAND:
   case ND_LOGOR: {
@@ -1086,6 +1436,8 @@ static MIR_reg_t gen_expr(Node *node) {
     return r;
   }
   case ND_EQ: case ND_NE: case ND_LT: case ND_LE: case ND_GT: case ND_GE: {
+    if (is_big_bitint(node->m.lhs->ty))
+      return gen_bitint_cmp(node);
     MIR_reg_t lhs = gen_expr(node->m.lhs);
     MIR_reg_t rhs = gen_expr(node->m.rhs);
     MIR_reg_t r = new_tmp(MIR_T_I64);
@@ -1095,9 +1447,11 @@ static MIR_reg_t gen_expr(Node *node) {
   case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_MOD:
   case ND_BITAND: case ND_BITOR: case ND_BITXOR:
   case ND_SHL: case ND_SHR: case ND_SAR: {
+    if (is_big_bitint(node->m.lhs->ty))
+      return gen_bitint_arith(node);
     MIR_reg_t lhs = gen_expr(node->m.lhs);
     MIR_reg_t rhs = gen_expr(node->m.rhs);
-    return gen_binop(node->kind, node->ty, lhs, rhs, node->tok);
+    return bitint_norm(gen_binop(node->kind, node->ty, lhs, rhs, node->tok), node->ty);
   }
   case ND_FUNCALL:
     return gen_funcall(node);
@@ -1188,7 +1542,7 @@ static MIR_reg_t gen_expr(Node *node) {
     // are copied into the parser-allocated buffer via VA_BLOCK_ARG.
     MIR_reg_t ap = gen_expr(node->m.lhs);
     Type *ty = node->ty->base;
-    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION || is_big_bitint(ty)) {
       MIR_reg_t buf = local_addr(node->m.var);
       out(MIR_new_insn(mc, MIR_VA_BLOCK_ARG, rop(buf), rop(ap), iop(ty->size), iop(0)));
       return buf;
@@ -1198,8 +1552,35 @@ static MIR_reg_t gen_expr(Node *node) {
                      MIR_new_mem_op(mc, mir_type(ty), 0, 0, 0, 1)));
     return r;
   }
-  case ND_CKD_ARITH:
-    error_tok(node->tok, "checked arithmetic is not yet supported by the MIR backend");
+  case ND_CKD_ARITH: {
+    // Checked arithmetic: compute in a _BitInt wide enough that the exact
+    // result fits, store the truncation, and test whether the full result
+    // exceeds the destination's range (mirrors codegen.c).
+    Type *res_ty = node->m.target->ty->base;
+    int32_t chk_bits = res_ty->is_unsigned + bit_size(res_ty);
+    int32_t bits = MAX(chk_bits, res_ty->size * 8);
+    bits = MAX(bits, ovf_headroom(node->m.lhs->ty, node->arith_kind));
+    bits = MAX(bits, ovf_headroom(node->m.rhs->ty, node->arith_kind));
+    bits = align_to(bits, 64);
+
+    Type *bty = new_bitint(bits, node->tok);
+    MIR_reg_t target = gen_expr(node->m.target);
+    MIR_reg_t lhs = gen_ckd_operand(node->m.lhs, bty);
+    MIR_reg_t rhs = gen_ckd_operand(node->m.rhs, bty);
+
+    BitintHelper h;
+    switch (node->arith_kind) {
+    case ND_ADD: h = BI_ADD; break;
+    case ND_SUB: h = BI_SUB; break;
+    case ND_MUL: h = BI_MUL; break;
+    default: internal_error();
+    }
+    bitint_call(h, 3, (MIR_op_t[]){iop(bits), rop(lhs), rop(rhs)});
+
+    gen_mem_copy(target, rhs, res_ty->size);
+    return bitint_call(BI_OVERFLOW, 4, (MIR_op_t[]){iop(bits), rop(rhs), iop(chk_bits),
+                                                    iop(res_ty->is_unsigned)});
+  }
   case ND_FRAME_ADDR:
   case ND_RTN_ADDR:
     error_tok(node->tok, "frame/return address builtins are not supported by the MIR backend");
@@ -1241,8 +1622,10 @@ static void gen_cond(Node *node, bool jump_on_true, MIR_label_t lab) {
     static const MIR_insn_code_t i[6] = {MIR_BEQ, MIR_BNE, MIR_BLT, MIR_BLE, MIR_BGT, MIR_BGE};
     static const MIR_insn_code_t u[6] = {MIR_BEQ, MIR_BNE, MIR_UBLT, MIR_UBLE, MIR_UBGT, MIR_UBGE};
 
-    // FP comparisons cannot be inverted (NaN); fall back to value+branch.
-    if (is_scalar_fp(ty) && !jump_on_true && node->kind != ND_EQ && node->kind != ND_NE)
+    // FP comparisons cannot be inverted (NaN), and big-bitint comparisons
+    // go through a helper call; fall back to value+branch.
+    if (is_big_bitint(ty) ||
+        (is_scalar_fp(ty) && !jump_on_true && node->kind != ND_EQ && node->kind != ND_NE))
       break;
 
     MIR_insn_code_t code;
@@ -1286,6 +1669,11 @@ static void gen_cond(Node *node, bool jump_on_true, MIR_label_t lab) {
   }
 
   MIR_reg_t v = gen_expr(node);
+  if (is_big_bitint(node->ty)) {
+    MIR_reg_t b = bitint_to_bool(node->ty, v);
+    out(MIR_new_insn(mc, jump_on_true ? MIR_BT : MIR_BF, MIR_new_label_op(mc, lab), rop(b)));
+    return;
+  }
   switch (node->ty->kind) {
   case TY_FLOAT: {
     MIR_reg_t b = new_tmp(MIR_T_I64);
@@ -1317,7 +1705,7 @@ static void gen_cond(Node *node, bool jump_on_true, MIR_label_t lab) {
 static void gen_return(Node *node) {
   Type *rt = cur_fn->ty->return_ty;
 
-  if (rt->kind == TY_STRUCT || rt->kind == TY_UNION) {
+  if (rt->kind == TY_STRUCT || rt->kind == TY_UNION || is_big_bitint(rt)) {
     if (node->m.lhs) {
       MIR_reg_t v = gen_expr(node->m.lhs); // aggregate value = its address
       gen_mem_copy(ret_addr_reg, v, rt->size);
@@ -1347,9 +1735,6 @@ static void gen_return(Node *node) {
     }
     return;
   }
-
-  if (rt->kind == TY_BITINT && rt->bit_cnt > 64)
-    error_tok(node->tok, "_BitInt wider than 64 bits is not yet supported by the MIR backend");
 
   MIR_reg_t v = gen_expr(node->m.lhs);
   if (has_defr(node))
@@ -1514,18 +1899,16 @@ void emit_text(Obj *fn) {
     error("constructor/destructor functions are not yet supported by the MIR backend");
 
   Type *rt = fn->ty->return_ty;
-  if (rt->kind == TY_BITINT && rt->bit_cnt > 64)
-    error("_BitInt wider than 64 bits is not yet supported by the MIR backend");
-
   cur_fn = fn;
   tmp_cnt = 0;
   scratch_slot = 0;
   free(label_map.buckets);
   label_map = (HashMap){0};
 
-  // Signature. Aggregates travel as MIR block args; struct returns become
-  // a hidden first RBLK argument carrying the caller's buffer.
-  bool rtn_by_addr = rt->kind == TY_STRUCT || rt->kind == TY_UNION;
+  // Signature. Aggregates and big bitints travel as MIR block args;
+  // struct and big-bitint returns become a hidden first RBLK argument
+  // carrying the caller's buffer.
+  bool rtn_by_addr = rt->kind == TY_STRUCT || rt->kind == TY_UNION || is_big_bitint(rt);
 
   int nparams = 0;
   for (Obj *p = fn->ty->param_list; p; p = p->param_next)
@@ -1541,9 +1924,7 @@ void emit_text(Obj *fn) {
     i++;
   }
   for (Obj *p = fn->ty->param_list; p; p = p->param_next, i++) {
-    if (p->ty->kind == TY_BITINT && p->ty->bit_cnt > 64)
-      error("_BitInt wider than 64 bits is not yet supported by the MIR backend");
-    if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION) {
+    if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION || is_big_bitint(p->ty)) {
       vars[i].type = MIR_T_BLK;
       vars[i].size = p->ty->size;
     } else {
@@ -1591,7 +1972,7 @@ void emit_text(Obj *fn) {
   i = rtn_by_addr;
   for (Obj *p = fn->ty->param_list; p; p = p->param_next, i++) {
     MIR_reg_t arg = MIR_reg(mc, vars[i].name, fn_func);
-    if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION)
+    if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION || is_big_bitint(p->ty))
       gen_mem_copy(local_addr(p), arg, p->ty->size);
     else
       store_scalar(p->ty, local_addr(p), 0, arg);
@@ -1745,6 +2126,8 @@ void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {
   memset_import = memcpy_import = memset_proto = memcpy_proto = NULL;
   memset(atomic_imports, 0, sizeof(atomic_imports));
   memset(atomic_protos, 0, sizeof(atomic_protos));
+  memset(bitint_items, 0, sizeof(bitint_items));
+  memset(bitint_protos, 0, sizeof(bitint_protos));
 
   for (int32_t i = 0; i < sym_items.capacity; i++) {
     HashEntry *ent = &sym_items.buckets[i];
