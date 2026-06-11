@@ -133,7 +133,7 @@ clean:
 MIR_DIR?=../mir
 
 LIB_SRCS=alloc.c bitint.c hashmap.c parse.c preprocess.c strings.c tokenize.c type.c unicode.c
-LIB_OBJS=$(LIB_SRCS:.c=.lib.o) codegen-mir.lib.o libslimcc.lib.o platform-mir.lib.o
+LIB_OBJS=$(LIB_SRCS:.c=.lib.o) codegen-mir.lib.o libslimcc.lib.o slimcc-mir-helpers.lib.o platform-mir.lib.o
 LIB_CFLAGS=-I. -I$(MIR_DIR) -fPIC
 
 .SUFFIXES: .lib.o

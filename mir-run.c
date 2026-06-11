@@ -120,7 +120,14 @@ int main(int argc, char **argv, char **envp) {
     return 1;
   }
   MIR_gen_init(ctx);
-  MIR_gen_set_optimize_level(ctx, 1);
+  MIR_gen_set_optimize_level(ctx, 2);
+  {
+    const char *dbg = getenv("MIR_GEN_DEBUG");
+    if (dbg) {
+      MIR_gen_set_debug_file(ctx, stderr);
+      MIR_gen_set_debug_level(ctx, atoi(dbg));
+    }
+  }
   MIR_link(ctx, MIR_set_gen_interface, import_resolver);
 
   int (*main_fn)(int, char **, char **) = MIR_gen(ctx, main_item);
