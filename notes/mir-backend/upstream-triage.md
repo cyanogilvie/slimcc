@@ -163,6 +163,9 @@ upstream master with a regression test, all merged into `meson`:
   taken from the stack crashed, worse than triaged. Post-fix passes.
 - **PR #420** cherry-picked onto `meson` with `-x` (authorship preserved).
 
+Upstream filings: PR #432 (fixes #423), PR #433 (fixes #424), issue #431 +
+PR #434 (aarch64 LD stack alignment) — all open alongside PR #430.
+
 Validation: full upstream `make test` green on x86_64 (incl. all
 bootstraps); c-tests gen suite 1072/1072 on each topic branch; slimcc
 suite 95/103 on x86_64 (baseline, the 8 by-design rejections);
