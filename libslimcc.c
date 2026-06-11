@@ -247,7 +247,27 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   return mod;
 }
 
+// Atomic helpers from slimcc-mir-helpers.c.
+extern bool __slimcc_jit_cas_1(void *, void *, uint8_t);
+extern bool __slimcc_jit_cas_2(void *, void *, uint16_t);
+extern bool __slimcc_jit_cas_4(void *, void *, uint32_t);
+extern bool __slimcc_jit_cas_8(void *, void *, uint64_t);
+extern uint8_t __slimcc_jit_exch_1(void *, uint8_t);
+extern uint16_t __slimcc_jit_exch_2(void *, uint16_t);
+extern uint32_t __slimcc_jit_exch_4(void *, uint32_t);
+extern uint64_t __slimcc_jit_exch_8(void *, uint64_t);
+extern void __slimcc_jit_fence(void);
+
 void slimcc_register_helpers(MIR_context_t ctx) {
   MIR_load_external(ctx, "memset", (void *)memset);
   MIR_load_external(ctx, "memcpy", (void *)memcpy);
+  MIR_load_external(ctx, "__slimcc_jit_cas_1", (void *)__slimcc_jit_cas_1);
+  MIR_load_external(ctx, "__slimcc_jit_cas_2", (void *)__slimcc_jit_cas_2);
+  MIR_load_external(ctx, "__slimcc_jit_cas_4", (void *)__slimcc_jit_cas_4);
+  MIR_load_external(ctx, "__slimcc_jit_cas_8", (void *)__slimcc_jit_cas_8);
+  MIR_load_external(ctx, "__slimcc_jit_exch_1", (void *)__slimcc_jit_exch_1);
+  MIR_load_external(ctx, "__slimcc_jit_exch_2", (void *)__slimcc_jit_exch_2);
+  MIR_load_external(ctx, "__slimcc_jit_exch_4", (void *)__slimcc_jit_exch_4);
+  MIR_load_external(ctx, "__slimcc_jit_exch_8", (void *)__slimcc_jit_exch_8);
+  MIR_load_external(ctx, "__slimcc_jit_fence", (void *)__slimcc_jit_fence);
 }

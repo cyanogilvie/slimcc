@@ -37,6 +37,9 @@ static HashMap label_map;  // label key -> MIR_label_t (function lifetime)
 
 static MIR_item_t memset_import, memcpy_import;
 static MIR_item_t memset_proto, memcpy_proto;
+static MIR_item_t atomic_imports[9], atomic_protos[9]; // cas 1/2/4/8, exch 1/2/4/8, fence
+static MIR_reg_t scratch_slot;  // lazily created 8-byte entry alloca, 0 if none
+static MIR_reg_t vla_base_slot; // slot holding entry stack position, 0 if none
 
 static MIR_reg_t gen_expr(Node *node);
 static MIR_reg_t gen_addr(Node *node);
@@ -519,18 +522,38 @@ static void name_labels(Node *n) {
 }
 
 static void gen_defr(Node *node) {
-  for (DeferStmt *defr = node->dfr_from; defr != node->dfr_dest; defr = defr->next) {
+  DeferStmt *defr = node->dfr_from;
+  DeferStmt *end = node->dfr_dest;
+
+  while (defr != end) {
     switch (defr->kind) {
-    case DF_VLA_DEALLOC:
-      // VLA stack is not yet released at scope exit (needs MIR
-      // BSTART/BEND); it is reclaimed at function return. VLAs in loops
-      // over-allocate until that lands.
+    case DF_VLA_DEALLOC: {
+      // Release VLA stack at scope exit (mirrors codegen.c): restore the
+      // stack position to the enclosing VLA's pointer if one exists in
+      // the surviving defer chain, else to the function entry position.
+      // A VLA's slot holds its allocation pointer, which equals the stack
+      // position right after its alloca.
+      while (defr->next != end && defr->next->kind == DF_VLA_DEALLOC)
+        defr = defr->next;
+
+      if (!cur_fn->dealloc_vla) {
+        defr = defr->next;
+        continue;
+      }
+
+      Obj *vla = defr->next ? defr->next->vla : NULL;
+      MIR_reg_t pos = load_scalar(ty_long, vla ? local_addr(vla) : vla_base_slot, 0);
+      out(MIR_new_insn(mc, MIR_BEND, rop(pos)));
+      defr = defr->next;
       continue;
+    }
     case DF_CLEANUP_FN:
       gen_void_expr(defr->cleanup_fn);
+      defr = defr->next;
       continue;
     case DF_DEFER_STMT:
       gen_stmt(defr->stmt);
+      defr = defr->next;
       continue;
     }
     internal_error();
@@ -642,6 +665,76 @@ static MIR_item_t get_memcpy(void) {
     memcpy_proto = MIR_new_proto_arr(mc, "memcpy.p", 1, &res, 3, vars);
   }
   return memcpy_import;
+}
+
+// Index into atomic_imports/protos: 0-3 cas by log2 size, 4-7 exch, 8 fence.
+static MIR_item_t get_atomic(int idx, MIR_item_t *proto) {
+  if (!atomic_imports[idx]) {
+    static const char *const names[9] = {
+      "__slimcc_jit_cas_1", "__slimcc_jit_cas_2", "__slimcc_jit_cas_4", "__slimcc_jit_cas_8",
+      "__slimcc_jit_exch_1", "__slimcc_jit_exch_2", "__slimcc_jit_exch_4", "__slimcc_jit_exch_8",
+      "__slimcc_jit_fence",
+    };
+    atomic_imports[idx] = MIR_new_import(mc, names[idx]);
+    char pname[40];
+    snprintf(pname, sizeof(pname), "%s.p", names[idx]);
+    MIR_type_t res = MIR_T_I8;
+    if (idx < 4) {
+      MIR_var_t vars[3] = {{MIR_T_P, "p", 0}, {MIR_T_P, "e", 0}, {MIR_T_I64, "d", 0}};
+      atomic_protos[idx] = MIR_new_proto_arr(mc, pname, 1, &res, 3, vars);
+    } else if (idx < 8) {
+      MIR_var_t vars[2] = {{MIR_T_P, "p", 0}, {MIR_T_I64, "v", 0}};
+      res = MIR_T_I64;
+      atomic_protos[idx] = MIR_new_proto_arr(mc, pname, 1, &res, 2, vars);
+    } else {
+      atomic_protos[idx] = MIR_new_proto_arr(mc, pname, 0, NULL, 0, NULL);
+    }
+  }
+  *proto = atomic_protos[idx];
+  return atomic_imports[idx];
+}
+
+static int atomic_size_idx(Type *ty, Token *tok) {
+  switch (ty->size) {
+  case 1: return 0;
+  case 2: return 1;
+  case 4: return 2;
+  case 8: return 3;
+  }
+  error_tok(tok, "unsupported type size for atomic operation in the MIR backend");
+}
+
+// One 8-byte stack slot per function for FP<->int bit transfers, created
+// on demand by prepending the alloca to the function entry.
+static MIR_reg_t get_scratch_slot(void) {
+  if (!scratch_slot) {
+    scratch_slot = new_tmp(MIR_T_I64);
+    MIR_prepend_insn(mc, fn_item,
+                     MIR_new_insn(mc, MIR_ALLOCA, rop(scratch_slot), iop(16)));
+  }
+  return scratch_slot;
+}
+
+// Move a value into an integer register carrying the bit pattern, via the
+// scratch slot for floating-point classes.
+static MIR_reg_t bits_of(Type *ty, MIR_reg_t val) {
+  if (!is_scalar_fp(ty))
+    return val;
+  MIR_reg_t slot = get_scratch_slot();
+  store_scalar(ty, slot, 0, val);
+  MIR_reg_t r = new_tmp(MIR_T_I64);
+  MIR_type_t ity = ty->size == 4 ? MIR_T_U32 : MIR_T_U64;
+  out(MIR_new_insn(mc, MIR_MOV, rop(r), MIR_new_mem_op(mc, ity, 0, slot, 0, 1)));
+  return r;
+}
+
+static MIR_reg_t value_of_bits(Type *ty, MIR_reg_t bits) {
+  if (!is_scalar_fp(ty))
+    return bits;
+  MIR_reg_t slot = get_scratch_slot();
+  MIR_type_t ity = ty->size == 4 ? MIR_T_U32 : MIR_T_U64;
+  out(MIR_new_insn(mc, MIR_MOV, MIR_new_mem_op(mc, ity, 0, slot, 0, 1), rop(bits)));
+  return load_scalar(ty, slot, 0);
 }
 
 static void gen_mem_zero(MIR_reg_t addr, int64_t size) {
@@ -834,9 +927,6 @@ static MIR_reg_t gen_arith_assign(Node *node, bool want_old) {
   // Mirrors codegen.c's gen_expr_null_lhs: a synthetic expression with an
   // ND_NULL_EXPR lhs lets add_type insert the conversion casts.
   Node *lhs = node->m.lhs;
-  if (lhs->ty->qual & Q_ATOMIC)
-    error_tok(node->tok, "atomic operations are not yet supported by the MIR backend");
-
   MIR_reg_t addr = gen_addr(lhs);
   MIR_reg_t old = load_node(lhs, addr);
 
@@ -903,8 +993,9 @@ static MIR_reg_t gen_expr(Node *node) {
   case ND_ADDR:
     return gen_addr(node->m.lhs);
   case ND_ASSIGN: {
-    if (node->m.lhs->ty->qual & Q_ATOMIC)
-      error_tok(node->tok, "atomic operations are not yet supported by the MIR backend");
+    // Plain assignment to _Atomic lvalues is an ordinary store, like
+    // codegen.c (atomic read-modify-write is lowered to CAS loops by the
+    // parser and arrives as ND_CAS).
     MIR_reg_t addr = gen_addr(node->m.lhs);
     MIR_reg_t val = gen_expr(node->m.rhs);
     return gen_store(node->m.lhs, addr, val);
@@ -1039,11 +1130,46 @@ static MIR_reg_t gen_expr(Node *node) {
     out(MIR_new_insn(mc, MIR_JMPI, rop(v)));
     return 0;
   }
-  case ND_CAS:
-  case ND_EXCH:
-    error_tok(node->tok, "atomic operations are not yet supported by the MIR backend");
-  case ND_THREAD_FENCE:
-    error_tok(node->tok, "atomic fences are not yet supported by the MIR backend");
+  case ND_CAS: {
+    // C11 compare-exchange through a host helper: *expected is updated on
+    // failure (matching codegen.c); float/double travel as bit patterns.
+    Type *ty = node->cas.addr->ty->base;
+    if (!is_scalar_fp(ty) && !is_integer(ty) && !is_ptr(ty))
+      error_tok(node->tok, "unsupported type for atomic CAS");
+    MIR_reg_t addr = gen_expr(node->cas.addr);
+    MIR_reg_t expected = gen_expr(node->cas.old_val);
+    MIR_reg_t desired = bits_of(ty, gen_expr(node->cas.new_val));
+
+    MIR_item_t proto;
+    MIR_item_t fn = get_atomic(atomic_size_idx(ty, node->tok), &proto);
+    MIR_reg_t res = new_tmp(MIR_T_I64);
+    out(MIR_new_insn_arr(mc, MIR_CALL, 6,
+                         (MIR_op_t[]){MIR_new_ref_op(mc, proto), MIR_new_ref_op(mc, fn),
+                                      rop(res), rop(addr), rop(expected), rop(desired)}));
+    return int_extend(res, ty_bool);
+  }
+  case ND_EXCH: {
+    Type *ty = node->m.lhs->ty->base;
+    MIR_reg_t addr = gen_expr(node->m.lhs);
+    MIR_reg_t val = bits_of(ty, gen_expr(node->m.rhs));
+
+    MIR_item_t proto;
+    MIR_item_t fn = get_atomic(4 + atomic_size_idx(ty, node->tok), &proto);
+    MIR_reg_t res = new_tmp(MIR_T_I64);
+    out(MIR_new_insn_arr(mc, MIR_CALL, 5,
+                         (MIR_op_t[]){MIR_new_ref_op(mc, proto), MIR_new_ref_op(mc, fn),
+                                      rop(res), rop(addr), rop(val)}));
+    if (is_scalar_fp(ty))
+      return value_of_bits(ty, res);
+    return is_integer(ty) && ty->size < 8 ? int_extend(res, ty) : res;
+  }
+  case ND_THREAD_FENCE: {
+    MIR_item_t proto;
+    MIR_item_t fn = get_atomic(8, &proto);
+    out(MIR_new_insn_arr(mc, MIR_CALL, 2,
+                         (MIR_op_t[]){MIR_new_ref_op(mc, proto), MIR_new_ref_op(mc, fn)}));
+    return 0;
+  }
   case ND_VA_START: {
     MIR_reg_t ap = gen_expr(node->m.lhs);
     out(MIR_new_insn(mc, MIR_VA_START, rop(ap)));
@@ -1393,6 +1519,7 @@ void emit_text(Obj *fn) {
 
   cur_fn = fn;
   tmp_cnt = 0;
+  scratch_slot = 0;
   free(label_map.buckets);
   label_map = (HashMap){0};
 
@@ -1449,6 +1576,17 @@ void emit_text(Obj *fn) {
   // arguments into their slots. A block argument's register holds the
   // block's address; copy it for by-value semantics.
   alloca_scope(fn->ty->scopes);
+
+  // Record the entry stack position for VLA deallocation. This comes
+  // after the entry allocas so that releasing all VLAs keeps them intact.
+  vla_base_slot = 0;
+  if (fn->dealloc_vla) {
+    vla_base_slot = new_tmp(MIR_T_I64);
+    out(MIR_new_insn(mc, MIR_ALLOCA, rop(vla_base_slot), iop(16)));
+    MIR_reg_t pos = new_tmp(MIR_T_I64);
+    out(MIR_new_insn(mc, MIR_BSTART, rop(pos)));
+    store_scalar(ty_long, vla_base_slot, 0, pos);
+  }
 
   i = rtn_by_addr;
   for (Obj *p = fn->ty->param_list; p; p = p->param_next, i++) {
@@ -1603,7 +1741,10 @@ void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {
   fn_func = NULL;
   cur_fn = NULL;
   tmp_cnt = proto_cnt = ctrl_cnt = 0;
+  scratch_slot = 0;
   memset_import = memcpy_import = memset_proto = memcpy_proto = NULL;
+  memset(atomic_imports, 0, sizeof(atomic_imports));
+  memset(atomic_protos, 0, sizeof(atomic_protos));
 
   for (int32_t i = 0; i < sym_items.capacity; i++) {
     HashEntry *ent = &sym_items.buckets[i];
