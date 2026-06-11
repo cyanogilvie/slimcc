@@ -166,6 +166,47 @@ upstream master with a regression test, all merged into `meson`:
 Upstream filings: PR #432 (fixes #423), PR #433 (fixes #424), issue #431 +
 PR #434 (aarch64 LD stack alignment) — all open alongside PR #430.
 
+## Alpine/musl validation (2026-06-11, Alpine 3.23.4 aarch64 EC2, gcc 15.2)
+
+Branch `support-musl-std-libs` (off upstream master, merged into `meson`)
+made the upstream suite runnable on musl; four distinct fixes were needed:
+
+1. **Driver dlopen tables** (the #307 root cause): c2mir-driver.c,
+   mir-bin-run.c, mir-bin-driver.c get a `__linux__ && !__GLIBC__` branch
+   dlopening `/lib/ld-musl-<arch>.so.1` (musl = one DSO for
+   libc/libm/libpthread/libdl).
+2. **runtests.sh**: BusyBox diff lacks `--strip-trailing-cr`; every .expect
+   comparison errored and counted as a mismatch (30 phantom failures/mode).
+   Now probed once.
+3. **c2mir aarch64 wchar_t** (in the same branch): builtin stddef said
+   `typedef int wchar_t;` but AAPCS64 wchar_t is unsigned; musl's
+   bits/alltypes.h *redeclares* wchar_t per-arch (glibc never does), so the
+   c2m bootstrap died with "repeated declaration wchar_t". Fixed to
+   unsigned (Apple kept signed) + __WCHAR_MAX__/__WCHAR_MIN__ predefines
+   corrected to gcc values.
+4. **slimcc had the same wchar_t bug** (slimcc commit 7094821): builtin
+   stddef.h now uses __WCHAR_TYPE__ (gcc-style, defined per-arch by
+   platform/mir.c), ty_wchar_t retyped to uint on aarch64.
+
+Results on Alpine aarch64:
+- c-tests: interp fully green 1073/1073; gen/O0/O1/O3 fail ONLY
+  c-tests/new/jcall.c (segfault *after* main returns; exotic
+  __builtin_jcall/jret + global register var, passes in interp, passed on
+  glibc-aarch64 — upstream bug in a feature we never emit; not chased).
+  gen-bb mode: also only jcall.c — the 3 glibc-aarch64 gen-bb long-double
+  failures do NOT reproduce on musl.
+- Bootstraps: all stages passed except `c2mir-bb-bootstrap-test`, which was
+  OOM-killed — the box has 922MB RAM and a full 953MB disk (no room for
+  swap). Environmental: bb bootstrap passed on the 2GB glibc box.
+- slimcc suite: **89/103** = the 8 by-design rejections + 6 x86-specific
+  test assumptions. unicode.c is the 6th: it asserts L'\xffffffff'>>31 ==
+  -1, but wchar_t is unsigned on aarch64 (gcc agrees: result 1); we
+  previously "passed" only because our wchar_t was wrongly signed. Zero
+  musl-specific failures.
+
+Conclusion: aarch64+musl is validated to the same level as the glibc
+targets. `support-musl-std-libs` is a candidate upstream PR (fixes #307).
+
 Validation: full upstream `make test` green on x86_64 (incl. all
 bootstraps); c-tests gen suite 1072/1072 on each topic branch; slimcc
 suite 95/103 on x86_64 (baseline, the 8 by-design rejections);
