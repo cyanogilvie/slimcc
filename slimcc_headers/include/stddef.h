@@ -13,7 +13,10 @@ typedef typeof(nullptr) nullptr_t;
 
 typedef unsigned long size_t;
 typedef long ptrdiff_t;
-typedef int wchar_t;
+#ifndef __WCHAR_TYPE__
+#define __WCHAR_TYPE__ int
+#endif
+typedef __WCHAR_TYPE__ wchar_t;
 typedef struct {
   long long __ll;
   long double __ld;

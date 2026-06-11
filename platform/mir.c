@@ -35,9 +35,13 @@ void platform_init_cc1(void) {
   init_ty_lp64();
 
 #if defined(__aarch64__)
-  // Plain char is unsigned in the AAPCS64 ABI.
+  // Plain char and wchar_t are unsigned in the AAPCS64 ABI. The builtin
+  // stddef.h picks up __WCHAR_TYPE__ like gcc's does; musl's alltypes.h
+  // redeclares wchar_t per-arch, so the types have to agree.
   ty_pchar->is_unsigned = true;
   define_macro("__CHAR_UNSIGNED__", "1");
+  ty_wchar_t = ty_uint;
+  define_macro("__WCHAR_TYPE__", "unsigned int");
 #endif
 }
 
