@@ -54,7 +54,13 @@ Zero-initialized over-aligned globals: bss over-allocation + address rounding in
 
 ## Memory behavior
 
-Steady-state leak figures from the harnesses in `notes/mir-backend/leak-harness-*.c`: success path ~1.1 kB/compile, failure path ~1.7 kB/compile. The *mixed* harness's larger growth is live module data retained in the context by design (each module carries its compiled bitint helpers) — NOT a leak.
+**Zero-leak under compile/release churn** (as of 2026-06): valgrind reports 0 definitely/indirectly/possibly lost on success, failure, and mixed paths, and reachable-at-exit is byte-identical across iteration counts; RSS is flat over 10k compiles. Four churn leaks were fixed to get there — re-check these invariants if touching any of them:
+- `File` structs (`new_file`) are tracked in tokenize.c's `file_pool`, freed in `tokenize_reset` (mirrors `file_contents`).
+- `FuncObj` comes from `cc1_arena`, not malloc (emit_text).
+- `parse_free_scopes()` must run on the error path BEFORE `arenas_off()` — nested Scope structs live in the still-on AST arena, and their `vars`/`tags` bucket arrays are heap (leave_scope only frees them when `fnctx` is set; an error unwind skips it).
+- The vfile registry is cleared in `tokenize_reset` (entries' names are strdup'd); `slimcc_compile` rebuilds it every call, so distinct TU names would otherwise accumulate forever.
+
+The *mixed* harness (persistent consumer context) grows ~640 kB per retained module — live module data kept by design, dominated by the compiled bitint helpers every module carries; freed by `MIR_finish` on the consumer context. NOT a leak. MIR has no per-module unload — consumers wanting compile/release churn should batch modules into expendable contexts.
 
 ## Operational gotchas
 
