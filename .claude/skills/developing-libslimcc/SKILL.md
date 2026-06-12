@@ -53,7 +53,7 @@ meson setup build && meson compile -C build && meson test -C build
 
 ## Suite baselines — do not re-investigate these
 
-- **x86_64 glibc: 97/103**. The 6 fails are by-design rejections: `asm`, `inline_asm`, `tls`, `tls2`, `attr_weak`, `builtin_return_address`. (`function2`/`xxxof_vmtype` — paramless C23 variadics — pass since the mir fork's `c23-zero-named-vararg` fixes; an unpatched mir turns them back into clean compile errors.)
+- **x86_64 glibc: 97/103**. The 6 fails are by-design rejections: `asm`, `inline_asm`, `tls`, `tls2`, `attr_weak`, `builtin_return_address`. (`function2`/`xxxof_vmtype` — paramless C23 variadics — pass since the mir fork's variadic fixes (upstream PRs #438/#439); an unpatched mir turns them back into clean compile errors.)
 - **aarch64, glibc AND musl, identical lists: 91/103 expected** (needs a confirmation sweep on the EC2 box; was 89 before the variadic fixes) = the 6 above + 6 x86-test-assumption failures that gcc-on-aarch64 fails identically: `cast.c`, `literal.c`, `function.c`, `bitfield2.c` (plain char is unsigned per AAPCS64), `float2.c` (x87 layout memcmp), `unicode.c` (asserts `L'\xffffffff'>>31 == -1` but aarch64 wchar_t is unsigned).
 
 A regression is a *change* against these lists, not membership in them.
