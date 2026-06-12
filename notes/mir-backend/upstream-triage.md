@@ -329,3 +329,32 @@ slimcc effect: x86_64 JIT suite 95→97/103 (function2, xxxof_vmtype now
 pass); remaining 6 are the by-design asm/TLS/weak/return-address
 rejections. With an unpatched mir the paramless-variadic guard removal
 degrades to a clean compile error via the MIR error longjmp.
+
+## aarch64 confirmation sweeps + new vararg bug (2026-06-12)
+
+Both aarch64 boxes re-swept on mir meson 48f6a8dd + slimcc b1385f4
+(variadic fixes + emutls TLS): Ubuntu glibc and Alpine musl both
+**92/103 with identical fail lists** = 4 by-design (asm, inline_asm,
+attr_weak, builtin_return_address) + 6 x86-test-assumptions + function2.c.
+tls/tls2 and xxxof_vmtype pass on aarch64 (emutls and the paramless
+variadic fixes are target-clean).
+
+function2.c is NOT a regression: it used to fail at compile time (it
+contains `va_fn(...)`), so its struct_test130/131 bodies never ran on
+aarch64. Now unmasked: an **aarch64 MIR-layer vararg bug** — a >16-byte
+by-value struct vararg mixed with FP varargs desyncs the va_list cursors.
+Minimal repro (aarch64-va-bigstruct-repro.c, probe ph, only two named
+ints): vararg list `LD, BigStruct(999), int, 4×double, BigStruct, LD`
+reads ld1=11.1 (the *last* LD's value), int=992 (= 999 & ~7, the
+qword-rounded struct size — a cursor advanced by the struct size where an
+8-byte step was meant, or vice versa), doubles=0; both structs and the
+final LD read correctly. Bisect: named-arg shape irrelevant (full
+G/F-struct named shape + short vararg lists all pass); shorter
+`BigStruct, double, LD` list passes; x86-64 passes everything; identical
+on -eg for glibc and musl.
+
+c2m cannot act as the oracle: `va_arg(ap, BigStruct)` fails to compile
+with "Wrong alias number" — a separate c2m bug worth its own upstream
+report. Next: reduce to a raw .mir VA_BLOCK_ARG test to confirm
+target-code locus (mir-aarch64.c va builtins / machinize), fix in fork,
+file upstream alongside #438/#439.
