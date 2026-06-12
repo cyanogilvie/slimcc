@@ -358,3 +358,44 @@ with "Wrong alias number" — a separate c2m bug worth its own upstream
 report. Next: reduce to a raw .mir VA_BLOCK_ARG test to confirm
 target-code locus (mir-aarch64.c va builtins / machinize), fix in fork,
 file upstream alongside #438/#439.
+
+## aarch64 by-ref block-arg clobber: root cause + fix (2026-06-12, PR #440)
+
+The function2.c failure was NOT in the va machinery at all: machinize_call
+(mir-gen-aarch64.c) emitted the copy of a by-reference (>2 qwords) block
+arg right before the call insn — after earlier args were already loaded
+into their hard regs. For >16-qword blocks the copy is a CALL to
+mir.blk_mov; only x0-x2 were saved around it, so FP args in v0-v7 and
+ints in x3-x7 were exposed both to physical clobber and to the RA
+legitimately reusing "call-clobbered" arg regs for temporaries (that is
+how ld1 read the *last* LD: its temp landed in v0). Not vararg-specific —
+any call with FP/late-GPR args before a 129+ byte struct. Fix: emit the
+copy in the pre-arg-load region next to the address ADD that already
+lived there, and advance curr_prev_call_insn to the ADD itself (the old
+DLIST_NEXT advance pointed at the first arg load, scattering later block
+args' insns mid-loads). riscv64/s390x share the pattern (untested, noted
+in PR). Branch fix-aarch64-blk-mov-clobber off master, **upstream PR
+#440**, merged to meson (8667bd8b).
+
+Tests: c-tests/mir/big-blk-arg2.mir (mirrors slimcc's emission: typed
+temps live across the copies + per-call proto; fails master aarch64 -eg,
+passes fixed; -ei unaffected) + big-blk-arg.mir (named-args canary —
+NOTE it passes even at base: the simple shape doesn't create enough reg
+pressure; the bug's visible symptoms are RA-dependent). c2mir can't
+oracle any of this — it lowers big aggregates itself and never emits
+>2-qword BLK call args.
+
+Validation: full make test green on x86_64, aarch64 glibc, and (meson
+tip, which has the musl std-libs fix) aarch64 musl; slimcc sweeps
+**93/103 on both aarch64 boxes**, identical lists, function2.c passing.
+
+Side discovery, NOT yet filed upstream: two va_block_arg insns sharing
+one dest register SIGSEGV gen's copy_prop (mir-gen.c:3235, NULL ssa edge
+on an input op) on both arches, master and fork meson. Reachable from C
+via c2m with the rvalue form `va_arg(ap, struct S).c[i]` used twice (a
+named-local assignment per read is fine) — this is also what the earlier
+"Wrong alias number" error on the Alpine c2m was (same corruption,
+different surfacing). slimcc shielded by construction (distinct alloca
+per struct-va_arg site); tclmir/cmark direct builders exposed. Minimal
+reproducers in /tmp/cp-crash.mir + /tmp/alias3.c (copy into the fork
+when filing).

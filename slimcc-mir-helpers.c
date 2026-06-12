@@ -39,6 +39,8 @@ void __slimcc_jit_fence(void) {
 // a JIT-loaded MIR module can get, so the backend lowers every TLS access
 // to __slimcc_emutls_get_address(&__emutls_v.<name>) - the same scheme as
 // gcc's -femulated-tls, with the runtime provided here instead of libgcc.
+// (Independent implementation of the well-known scheme; the control object
+// shape is the ABI slimcc's stock codegen already emits for -femulated-tls.)
 // The control object layout matches what codegen-mir.c emits:
 // {size, align, index (0 until assigned here), init template}.
 //
