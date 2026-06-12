@@ -310,9 +310,20 @@ Note relation to the earlier #136/#142 triage: those covered structs
 passed AS varargs (fine); this is structs as NAMED params before the
 ellipsis.
 
-Both commits are upstream-PR candidates (not yet filed): the rounding
-fix is a clear bug fix; the check removal is C23 enablement that
-upstream may want a c-tests case for.
+Filed upstream (2026-06-12): **PR #438** (fix-x86_64-va-start-offsets)
+— deeper than the first-cut rounding fix: the va_start named-arg scan
+also failed to count REGISTER-passed blocks (BLK+1/+2) into
+gp_offset/fp_offset (c2m C11 repro: two struct{long} params before
+`...` make va_arg return s2.a), and its fp-exhaustion test checked
+gp_offset >= 176. The fix replaces the scan with the prologue walk's
+int_arg_num/fp_arg_num/mem_size totals (as aarch64 already does);
+regression test c-tests/new/va-struct-args.c fails on master, passes
+all modes with the fix. **PR #439** (allow-paramless-vararg-func) —
+check removal + c-tests/mir/paramless-vararg.mir; c2mir is unaffected
+(its C11 grammar rejects `(...)` with its own syntax error, so no
+diagnostic was delegated to the MIR layer). Both branches off upstream
+master, full make test green each; both merged to `meson` (the
+counter-based rewrite supersedes the earlier rounding-only commit).
 
 slimcc effect: x86_64 JIT suite 95→97/103 (function2, xxxof_vmtype now
 pass); remaining 6 are the by-design asm/TLS/weak/return-address
