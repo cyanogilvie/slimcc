@@ -1959,10 +1959,6 @@ void emit_text(Obj *fn) {
   MIR_type_t res_ty = nres ? mir_type(rt) : MIR_T_UNDEF;
   const char *name = sym_name(fn);
 
-  if (fn->ty->is_variadic && nargs == 0)
-    error("variadic function '%s' without named parameters is not supported "
-          "by the MIR backend", name);
-
   fn_item = fn->ty->is_variadic
                 ? MIR_new_vararg_func_arr(mc, name, nres, &res_ty, nargs, vars)
                 : MIR_new_func_arr(mc, name, nres, &res_ty, nargs, vars);
