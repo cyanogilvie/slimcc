@@ -830,6 +830,7 @@ bool equal_tok(Token *a, Token *b);
 Obj *get_symbol_var(const char *);
 Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **cond_var);
 void parse_reset(void);
+void parse_free_scopes(void);
 
 //
 // bitint.c

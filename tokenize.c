@@ -1330,6 +1330,13 @@ static struct {
   int len;
 } file_contents;
 
+// Likewise the File structs themselves (tokens point at them).
+static struct {
+  File **data;
+  int capacity;
+  int len;
+} file_pool;
+
 static void track_file_contents(char *buf) {
   if (file_contents.len >= file_contents.capacity) {
     file_contents.capacity = file_contents.capacity ? file_contents.capacity * 2 : 32;
@@ -1414,6 +1421,11 @@ int add_display_file(const char *path) {
 
 File *new_file(const char *name, const char *contents) {
   File *file = calloc(1, sizeof(File));
+  if (file_pool.len >= file_pool.capacity) {
+    file_pool.capacity = file_pool.capacity ? file_pool.capacity * 2 : 32;
+    file_pool.data = realloc(file_pool.data, file_pool.capacity * sizeof(File *));
+  }
+  file_pool.data[file_pool.len++] = file;
   file->name = name;
   file->file_no = file->display_file_no = add_display_file(name);
   file->contents = contents;
@@ -1496,8 +1508,22 @@ void tokenize_reset(void) {
     free(file_contents.data[i]);
   free(file_contents.data);
   memset(&file_contents, 0, sizeof(file_contents));
+  for (int i = 0; i < file_pool.len; i++)
+    free(file_pool.data[i]);
+  free(file_pool.data);
+  memset(&file_pool, 0, sizeof(file_pool));
   for (int i = 0; i < tok_pool.len; i++)
     free(tok_pool.blocks[i]);
   free(tok_pool.blocks);
   memset(&tok_pool, 0, sizeof(tok_pool));
+  // The vfile registry is rebuilt by every slimcc_compile (embedded
+  // headers, caller vfiles, the TU source); without this, distinct
+  // source names would accumulate entries forever.
+  for (int i = 0; i < vfiles.capacity; i++) {
+    const char *key = vfiles.buckets[i].key;
+    if (key && key != TOMBSTONE)
+      free((char *)key);
+  }
+  free(vfiles.buckets);
+  vfiles = (HashMap){0};
 }

@@ -6103,6 +6103,18 @@ Obj *parse(Token *tok) {
   return glb_head->next;
 }
 
+// Free the bucket arrays of every scope still on the stack after an error
+// unwind. Must run before the AST arena is recycled - the nested Scope
+// structs live there, so parse_reset (which runs after) cannot reach them.
+void parse_free_scopes(void) {
+  for (Scope *sc = scope; sc; sc = sc->parent) {
+    free(sc->vars.buckets);
+    free(sc->tags.buckets);
+    sc->vars = (HashMap){0};
+    sc->tags = (HashMap){0};
+  }
+}
+
 // Reset all parser state so a new compilation can run in the same process
 // (library mode). Symbol storage is owned by the arenas; the bucket arrays
 // are freed here.

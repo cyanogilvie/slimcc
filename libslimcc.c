@@ -231,6 +231,7 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
       break;
     }
     compile_active = false;
+    parse_free_scopes(); // nested Scopes live in the still-on AST arena
     arenas_off();
     fclose(slimcc_diag_file);
     slimcc_diag_file = NULL;

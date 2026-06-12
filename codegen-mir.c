@@ -1971,7 +1971,7 @@ void emit_text(Obj *fn) {
 
   ret_addr_reg = rtn_by_addr ? MIR_reg(mc, "Ret.Addr", fn_func) : 0;
 
-  fn->output = calloc(1, sizeof(FuncObj));
+  fn->output = arena_calloc(&cc1_arena, sizeof(FuncObj));
   fn->output->item = fn_item;
 
   // Slots for all locals (parameters included), then spill the incoming
