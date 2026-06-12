@@ -234,3 +234,52 @@ bootstraps); c-tests gen suite 1072/1072 on each topic branch; slimcc
 suite 95/103 on x86_64 (baseline, the 8 by-design rejections);
 aarch64 suite run pending/green per session log. #383
 (MIR_get_global_item definition) deferred — take when first needed.
+
+### CORRECTION: the bb-bootstrap "musl memory characteristic" was a real bug (2026-06-12)
+
+The previous section's conclusion was wrong. Root-caused on an 8GB Alpine
+box (alpine@18.228.203.188): the OOM was **upstream bug #436**, not a
+mallocng peak-memory characteristic, and not bounded — the run consumed
+7.87GB in 17.6s before the OOM kill (would grow toward ~46GB), at -p4,
+-p1, AND plain -eb. Reproduces identically on upstream master + musl
+driver tables only, so none of our fork fixes were involved.
+
+Mechanism (full analysis in mir INTERNALS.md §15 and upstream #436):
+
+1. The aarch64 **bb thunk clobbers x9** — `mov x9, <bb_version>` followed
+   by a branch to the bb wrapper emitted via `_MIR_redirect_thunk`, whose
+   far form is `ldr x9,8; br x9`. A thunk published >±128MB (direct-branch
+   reach) from the wrapper hands the wrapper **its own address** as
+   bb_version; machine-code bytes read as `attrs[i].spot` (~2.9e9, stp
+   opcodes — verified in gdb: bb_version == gen_ctx->bb_wrapper exactly)
+   make set_spot2attr grow spot2attr toward tens of GB.
+2. With that fixed, generated bb code next dies in `setup_rel` ("too big
+   offset") on direct branches to far successor thunks — lazy-bb generally
+   assumes all JIT code is mutually within direct-branch range.
+
+Why musl: glibc grows the heap with brk (code-holder mmaps stay
+clustered); mallocng's many mmaps interleave with code holders and push
+them hundreds of MB apart at bootstrap scale (~400MB compiler heap).
+Latent on glibc too for large enough -eb workloads. -eg/-ei were immune
+(function thunks carry no payload in x9), which is why only bb-bootstrap
+failed. riscv64/ppc64 already used a separate register for the far
+redirect; x86_64 is safe (payload r10, redirect r11) modulo a ±2GB
+analogue (jmp rel32 silently truncates).
+
+Fix: fork branch `fix-aarch64-bb-thunk-clobber` (2 commits: x10-based far
+redirect for the bb thunk; 128MB contiguous code-space reservation in
+mir.c carving all code holders so direct-branch range holds by
+construction — VA-only cost, 64-bit non-Windows). Filed upstream as
+**issue #436 + PR #437**; merged into `meson`.
+
+Results with the fix: Alpine bb-bootstrap **passes in 7.0s at 535MB peak**
+(glibc x86_64: 575MB — musl is no outlier after all; measured matrix:
+musl step1 379MB, -eg 550MB, -ei 507MB, all in line with glibc). Full
+`make test` green on x86_64; Alpine full suite re-run in progress
+(expect green except known jcall.c).
+
+Investigation gotcha worth remembering: hand-built c2m **must** use the
+GNUmakefile's `-fsigned-char -fno-tree-sra -fno-ipa-cp-clone` — without
+-fsigned-char, aarch64's unsigned plain char makes out_insn's template
+parser (`char d; (d = hex_value(*p)) >= 0`) loop/crash, producing
+convincing but bogus failure modes that cost us a detour.
