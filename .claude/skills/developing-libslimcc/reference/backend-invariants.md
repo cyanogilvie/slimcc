@@ -50,7 +50,7 @@ Zero-initialized over-aligned globals: bss over-allocation + address rounding in
 
 - A named MIR data item plus its following anonymous items merge into **one malloc per named item** — each named object gets its own 16-aligned allocation (relied on by the over-aligned-global rounding).
 - Computed goto emits `MIR_LADDR`/`MIR_JMPI` + `lref_data` static tables — this is why the fork's #424 (jump_opt lref UAF) and #430 (LADDR out-flag) fixes were mandatory. The GVN #423 fix is belt-and-braces here: slimcc is shielded by construction (explicit ext32 after every narrowing load), but direct MIR builders (tclmir/cmark) are exposed.
-- Paramless C23 variadics (`int f(...)` + `va_start(ap)`) work, but only with the mir fork's `c23-zero-named-vararg` fixes (MIR's ≥1-named-arg check removed; x86-64 va_start BLK-size rounding). With an unpatched mir they fail as a clean compile error via the MIR error longjmp, not a crash. The rounding fix matters beyond C23: any function with memory-passed struct params whose sizes aren't multiples of 8 had a misplaced `overflow_arg_area`, corrupting all stack-passed varargs.
+- Paramless C23 variadics (`int f(...)` + `va_start(ap)`) work, but only with the mir fork's fixes (upstream PRs #438/#439: MIR's ≥1-named-arg check removed; x86-64 va_start offsets rebuilt from the machinize counters). With an unpatched mir they fail as a clean compile error via the MIR error longjmp, not a crash. The va_start fix matters beyond C23: register-passed struct params weren't counted into gp/fp_offset (plain C11 via c2m misread varargs) and memory-passed params of non-multiple-of-8 size misplaced `overflow_arg_area`.
 
 ## Memory behavior
 
