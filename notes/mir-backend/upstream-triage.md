@@ -283,3 +283,38 @@ GNUmakefile's `-fsigned-char -fno-tree-sra -fno-ipa-cp-clone` — without
 -fsigned-char, aarch64's unsigned plain char makes out_insn's template
 parser (`char d; (d = hex_value(*p)) >= 0`) loop/crash, producing
 convincing but bogus failure modes that cost us a detour.
+
+## Paramless C23 variadics + x86-64 va_start BLK rounding (2026-06-12)
+
+`int f(...)` (C23, no named params) was rejected by mir.c's front-end
+check "Variable arg function w/o any mandatory argument" in
+new_func_arr. Investigation showed nothing downstream needs a named
+arg: prologue register-save areas are gated on vararg_p alone, both
+targets' VA_START lowering walks nargs from zero, protos with zero
+named args were already accepted (call sites worked all along), and
+the textual writer even anticipated the case (`nargs == 0 && nres == 0
+? "..." : ", ..."`). Removing the check (fork branch
+`c23-zero-named-vararg`, merged to meson) makes scan, .bmir
+write/read, interp shim, and gen all handle it; MIR's full make test
+stays green.
+
+Lifting the check unmasked a REAL pre-existing x86-64 bug: VA_START
+machinization accumulated `mem_offset += var.size` for memory-passed
+BLK named args, but the argument area lays each BLK out rounded to 8
+(`(size+7)/8*8`, same file). Named structs of non-multiple-of-8 size
+before `...` put overflow_arg_area short of the true vararg start —
+slimcc's function2.c struct_test131 (5×1-byte + 6×4-byte structs) read
+every stack vararg 59 bytes low. One-line fix (round like the arg
+area). aarch64 already rounds via qwords in machinize — unaffected.
+Note relation to the earlier #136/#142 triage: those covered structs
+passed AS varargs (fine); this is structs as NAMED params before the
+ellipsis.
+
+Both commits are upstream-PR candidates (not yet filed): the rounding
+fix is a clear bug fix; the check removal is C23 enablement that
+upstream may want a c-tests case for.
+
+slimcc effect: x86_64 JIT suite 95→97/103 (function2, xxxof_vmtype now
+pass); remaining 6 are the by-design asm/TLS/weak/return-address
+rejections. With an unpatched mir the paramless-variadic guard removal
+degrades to a clean compile error via the MIR error longjmp.
