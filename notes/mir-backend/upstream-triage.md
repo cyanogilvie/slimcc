@@ -399,3 +399,40 @@ different surfacing). slimcc shielded by construction (distinct alloca
 per struct-va_arg site); tclmir/cmark direct builders exposed. Minimal
 reproducers in /tmp/cp-crash.mir + /tmp/alias3.c (copy into the fork
 when filing).
+
+## PR #440 extended to riscv64/s390x/ppc64; issue #441 filed (2026-06-12)
+
+Issue **#441** (copy_prop SIGSEGV on same-dest va_block_arg pairs) filed
+with .mir + C-via-c2m reproducers. PR #440 retitled/extended to all four
+copying targets after qemu-user validation (qemu-user + gcc cross
+toolchains for riscv64/s390x/ppc64le now installed on this box):
+
+- riscv64: CERTAIN — identical pattern, and gen_blk_mov's save_regs>2
+  restore wrote R2 (= sp on riscv64!) instead of A2: base c2m SIGSEGVs on
+  the regression test, fixed passes. Proof the path never ran there.
+- s390x: confirmed under qemu — base rc 1 / SIGSEGV, fixed passes.
+- ppc64le: pattern identical by inspection (f1-f13 unprotected) but not
+  reproducible with our test shape — ELFv2's f14-f31 callee-saved file
+  absorbs the RA pressure; fix is prophylactic, no deltas across the
+  whole .mir suite base vs fixed.
+- Validation method: cross-built static c2m at base + branch per target,
+  ran ALL c-tests/mir/*.mir under qemu -eg both ways; only deltas = the
+  new test flipping to pass (riscv64 139→0, s390x 1→0).
+
+big-blk-arg2.mir reworked to be vararg-ABI-portable: varargs UNNAMED in
+the proto (riscv64 passes variadic FP args in GPRs — naming them changes
+their class!) and doubles instead of LDs (riscv64 has a separate
+pre-existing LD-vararg misread, noted in the PR). Still fails base
+aarch64 rc 1 (re-verified on the box) — LD wasn't needed for the repro.
+
+Two NEW riscv64 upstream observations (noted in PR #440, not filed as
+issues, relevant if slimcc ever targets riscv64): (1) LD varargs misread
+even with the copy fix; (2) protos naming variadic args assign them FP
+regs while the callee's va_arg reads GPRs — slimcc's per-call-site
+all-named protos would hit exactly this; the named-vararg proto
+convention is ABI-broken on riscv64 (c2mir presumably shares it).
+
+mir fork meson = c9735704 (branch tip c2b62f2b merged; earlier history
+rewritten once to purge accidentally committed tags + two build
+binaries — that rewrite is why mir-bin-run/readme-example-test showed as
+"local changes" on the boxes).
