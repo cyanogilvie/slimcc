@@ -2168,7 +2168,9 @@ Token *prepare_parse(Token *tok) {
                                     ),
                            NULL, &cur);
 
-    const char *path = search_include_paths("bitint_builtins", NULL);
+    // Library mode supplies the _BitInt helpers as host-compiled imports
+    // (slimcc_register_helpers) instead of compiling them into every module.
+    const char *path = slimcc_lib_mode ? NULL : search_include_paths("bitint_builtins", NULL);
     if (path) {
       Token *end;
       cur->next = tokenize_file(path, NULL, &end);

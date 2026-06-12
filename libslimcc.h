@@ -45,9 +45,10 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
                             const slimcc_options *opt, char **errmsg);
 
 // Register the runtime helper functions that compiled code may reference
-// (currently memset/memcpy for aggregate initialization) with a MIR context
-// via MIR_load_external. Call once per context before MIR_link, or provide
-// the symbols through your own import resolver instead.
+// (memset/memcpy for aggregate initialization, atomics, and the >64-bit
+// _BitInt arithmetic helpers) with a MIR context via MIR_load_external.
+// Call once per context before MIR_link, or provide the symbols through
+// your own import resolver instead.
 void slimcc_register_helpers(MIR_context_t ctx);
 
 #endif

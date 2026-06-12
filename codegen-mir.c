@@ -816,9 +816,11 @@ static void gen_mem_copy(MIR_reg_t dst, MIR_reg_t src, int64_t size) {
 //
 // _BitInt wider than 64 bits ("big"): the value is the address of a
 // little-endian 64-bit-chunk buffer, and all operations go through the
-// __slimcc_bitint_* helpers from the injected bitint_builtins header,
-// which this backend compiles into every module like any other function
-// (mirrors codegen.c's lowering). Helper convention: lh/src operands are
+// __slimcc_bitint_* helpers, which are host-compiled into the library
+// (slimcc-mir-helpers.c) and reached through imports that
+// slimcc_register_helpers() resolves - modules don't carry their own
+// compiled copies the way the CLI compiler's injected bitint_builtins
+// header works. Helper convention: lh/src operands are
 // read-only and results land in rh/dst, except that div clobbers both
 // and to_bool canonicalizes its operand in place — operands that alias
 // program memory are copied into fresh buffers accordingly.
@@ -899,8 +901,6 @@ static MIR_type_t bitint_arg_type(char c) {
 static MIR_item_t get_bitint_fn(BitintHelper h, MIR_item_t *proto) {
   if (!bitint_items[h]) {
     const char *name = bitint_fns[h].name;
-    if (!get_symbol_var(name))
-      error("missing builtin function %s", name);
     SymItem *si = sym_entry(name);
     if (!si->item)
       si->item = MIR_new_forward(mc, si->key);
