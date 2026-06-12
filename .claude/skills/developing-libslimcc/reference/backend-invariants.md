@@ -52,6 +52,14 @@ Zero-initialized over-aligned globals: bss over-allocation + address rounding in
 - Computed goto emits `MIR_LADDR`/`MIR_JMPI` + `lref_data` static tables — this is why the fork's #424 (jump_opt lref UAF) and #430 (LADDR out-flag) fixes were mandatory. The GVN #423 fix is belt-and-braces here: slimcc is shielded by construction (explicit ext32 after every narrowing load), but direct MIR builders (tclmir/cmark) are exposed.
 - Paramless C23 variadics (`int f(...)` + `va_start(ap)`) work, but only with the mir fork's fixes (upstream PRs #438/#439: MIR's ≥1-named-arg check removed; x86-64 va_start offsets rebuilt from the machinize counters). With an unpatched mir they fail as a clean compile error via the MIR error longjmp, not a crash. The va_start fix matters beyond C23: register-passed struct params weren't counted into gp/fp_offset (plain C11 via c2m misread varargs) and memory-passed params of non-multiple-of-8 size misplaced `overflow_arg_area`.
 
+## Thread-local storage (emutls)
+
+`_Thread_local` is lowered gcc `-femulated-tls` style — native TLS needs a dynamic-linker-assigned TLS module (or static-TLS offsets fixed at program start), neither obtainable for JIT-loaded MIR modules:
+- Every address-of access becomes `__slimcc_emutls_get_address(&__emutls_v.<name>)` (gen_addr); the variable's own name never becomes a MIR symbol. The control object `{size, align, index, templ}` and the `__emutls_t.<name>` init image are emitted by `emit_data_obj`; cross-module extern TLS works via export/import of `__emutls_v.<name>` (validated). MIR identifiers accept `.` (mir.c scanner), so textual dumps round-trip.
+- The runtime lives in `slimcc-mir-helpers.c`. Platform exposure is four shimmed primitives: pthread_key (destructor frees per-thread copies at thread exit) / mutex / posix_memalign on POSIX; **FlsAlloc** (not TlsAlloc — FLS has destructor callbacks) / SRWLOCK / `_aligned_malloc` on Win32. Index assignment doubles as key creation; the acquire-load of `index` is what makes the key visible to lock-skipping threads.
+- Limitations: a host-defined native-TLS `_Thread_local` can't be accessed from JIT code (and vice versa) — same ABI split gcc documents for -femulated-tls; `errno` unaffected (`__errno_location()`). Every access is a call. `&tls_var` in a static initializer is a compile error (no TLS relocations). Over-aligned TLS works (runtime honors the control align word) — the template's alignment is deliberately clamped ≤16 in emission.
+- Main thread's copies are reclaimed only at process exit (key destructors don't run for main) — valgrind-clean as reachable.
+
 ## Memory behavior
 
 **Zero-leak under compile/release churn** (as of 2026-06): valgrind reports 0 definitely/indirectly/possibly lost on success, failure, and mixed paths, and reachable-at-exit is byte-identical across iteration counts; RSS is flat over 10k compiles. Four churn leaks were fixed to get there — re-check these invariants if touching any of them:
