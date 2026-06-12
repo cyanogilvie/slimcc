@@ -38,6 +38,7 @@ static HashMap label_map;  // label key -> MIR_label_t (function lifetime)
 static MIR_item_t memset_import, memcpy_import;
 static MIR_item_t memset_proto, memcpy_proto;
 static MIR_item_t atomic_imports[9], atomic_protos[9]; // cas 1/2/4/8, exch 1/2/4/8, fence
+static MIR_item_t emutls_import, emutls_proto;
 static MIR_reg_t scratch_slot;  // lazily created 8-byte entry alloca, 0 if none
 static MIR_reg_t vla_base_slot; // slot holding entry stack position, 0 if none
 
@@ -727,6 +728,26 @@ static MIR_item_t get_memcpy(void) {
   return memcpy_import;
 }
 
+static MIR_item_t get_emutls(MIR_item_t *proto) {
+  if (!emutls_import) {
+    emutls_import = MIR_new_import(mc, "__slimcc_emutls_get_address");
+    MIR_var_t var = {MIR_T_P, "c", 0};
+    MIR_type_t res = MIR_T_P;
+    emutls_proto = MIR_new_proto_arr(mc, "__slimcc_emutls_get_address.p", 1, &res, 1, &var);
+  }
+  *proto = emutls_proto;
+  return emutls_import;
+}
+
+// The control object a thread-local variable is accessed through (see
+// emit_data_obj); the variable's own name never becomes a MIR symbol.
+static MIR_item_t emutls_ctrl_item(Obj *var) {
+  SymItem *si = sym_entry(arena_format(&cc1_arena, "__emutls_v.%s", sym_name(var)));
+  if (!si->item)
+    si->item = MIR_new_forward(mc, si->key);
+  return si->item;
+}
+
 // Index into atomic_imports/protos: 0-3 cas by log2 size, 4-7 exch, 8 fence.
 static MIR_item_t get_atomic(int idx, MIR_item_t *proto) {
   if (!atomic_imports[idx]) {
@@ -1171,8 +1192,21 @@ static MIR_reg_t gen_addr(Node *node) {
         return load_scalar(ty_long, local_addr(var), 0);
       return local_addr(var);
     }
-    if (var->is_tls)
-      error_tok(node->tok, "thread-local storage is not supported by the MIR backend");
+    // Thread-local: resolve the per-thread copy through the emutls runtime
+    // (native TLS needs dynamic-linker cooperation that JIT-loaded modules
+    // cannot get). The runtime honors the control object's alignment, so
+    // the over-aligned rounding below doesn't apply.
+    if (var->is_tls) {
+      MIR_item_t proto;
+      MIR_item_t fn = get_emutls(&proto);
+      MIR_reg_t ctrl = new_tmp(MIR_T_I64);
+      out(MIR_new_insn(mc, MIR_MOV, rop(ctrl), MIR_new_ref_op(mc, emutls_ctrl_item(var))));
+      MIR_reg_t res = new_tmp(MIR_T_I64);
+      out(MIR_new_insn_arr(mc, MIR_CALL, 4,
+                           (MIR_op_t[]){MIR_new_ref_op(mc, proto), MIR_new_ref_op(mc, fn),
+                                        rop(res), rop(ctrl)}));
+      return res;
+    }
     MIR_reg_t r = new_tmp(MIR_T_I64);
     out(MIR_new_insn(mc, MIR_MOV, rop(r), MIR_new_ref_op(mc, sym_item(var))));
     // Over-aligned objects live at the rounded-up address inside their
@@ -2044,10 +2078,51 @@ static const void *memchr_inv_zero(const char *p, int64_t n) {
 }
 
 static void emit_data_obj(Obj *var) {
-  if (var->is_tls)
-    error("thread-local storage is not supported by the MIR backend");
   if (var->alias_name)
     error("symbol aliases are not supported by the MIR backend");
+
+  // Thread-local: emit the gcc -femulated-tls shape - an __emutls_v.<name>
+  // control object {size, align, index, template} consumed by the runtime's
+  // __slimcc_emutls_get_address, plus the init image as an ordinary
+  // module-local data object. All code references go through the control
+  // object (see gen_addr), so the variable's own name is never defined.
+  if (var->is_tls) {
+    const char *name = sym_name(var);
+    const char *name_t = arena_format(&cc1_arena, "__emutls_t.%s", name);
+    const char *name_v = arena_format(&cc1_arena, "__emutls_v.%s", name);
+
+    int64_t size = MAX(var->ty->size, 1);
+    if (var->ty->kind == TY_ARRAY && var->ty->size < 0)
+      size = MAX(var->ty->base->size, 1);
+    else if (var->ty->size < 0)
+      error("object '%s' has incomplete type", name);
+
+    // Forward for the ref_data below; created before the template item so
+    // it isn't interleaved between that object's data chunks.
+    SymItem *ti = sym_entry(name_t);
+    if (!ti->item)
+      ti->item = MIR_new_forward(mc, ti->key);
+
+    // The per-thread copy is made from the template by the runtime, so the
+    // template's own address and alignment conventions don't matter; clamp
+    // the alignment so emission doesn't take the over-aligned bss path.
+    Obj tmp = *var;
+    tmp.is_tls = false;
+    tmp.is_static = true;
+    tmp.name = (char *)name_t;
+    tmp.asm_name = tmp.alias_name = NULL;
+    if (obj_align(var) > 16)
+      tmp.alt_align = 16;
+    emit_data_obj(&tmp);
+
+    int64_t words[3] = {size, obj_align(var), 0};
+    MIR_new_data(mc, name_v, MIR_T_I64, 3, words);
+    MIR_new_ref_data(mc, NULL, ti->item, 0);
+    sym_mark_defined(name_v);
+    if (!var->is_static)
+      MIR_new_export(mc, name_v);
+    return;
+  }
 
   const char *name = sym_name(var);
   int64_t size = MAX(var->ty->size, 1);
@@ -2091,6 +2166,9 @@ static void emit_data_obj(Obj *var) {
   // address is rounded up past that) cannot be expressed.
   for (Relocation *rel = var->rel; rel; rel = rel->next)
     if (rel->var) {
+      if (rel->var->is_tls)
+        error("static initializer takes the address of thread-local '%s', "
+              "which is not supported by the MIR backend", sym_name(rel->var));
       if (obj_align(rel->var) > 16 && rel->var->ty->kind != TY_FUNC)
         error("static initializer takes the address of over-aligned object '%s', "
               "which is not supported by the MIR backend", sym_name(rel->var));
@@ -2173,6 +2251,7 @@ void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {
   tmp_cnt = proto_cnt = ctrl_cnt = 0;
   scratch_slot = 0;
   memset_import = memcpy_import = memset_proto = memcpy_proto = NULL;
+  emutls_import = emutls_proto = NULL;
   memset(atomic_imports, 0, sizeof(atomic_imports));
   memset(atomic_protos, 0, sizeof(atomic_protos));
   memset(bitint_items, 0, sizeof(bitint_items));

@@ -300,6 +300,7 @@ extern uint16_t __slimcc_jit_exch_2(void *, uint16_t);
 extern uint32_t __slimcc_jit_exch_4(void *, uint32_t);
 extern uint64_t __slimcc_jit_exch_8(void *, uint64_t);
 extern void __slimcc_jit_fence(void);
+extern void *__slimcc_emutls_get_address(void *);
 extern void slimcc_register_bitint_helpers(MIR_context_t ctx);
 
 void slimcc_register_helpers(MIR_context_t ctx) {
@@ -315,4 +316,5 @@ void slimcc_register_helpers(MIR_context_t ctx) {
   MIR_load_external(ctx, "__slimcc_jit_exch_4", (void *)__slimcc_jit_exch_4);
   MIR_load_external(ctx, "__slimcc_jit_exch_8", (void *)__slimcc_jit_exch_8);
   MIR_load_external(ctx, "__slimcc_jit_fence", (void *)__slimcc_jit_fence);
+  MIR_load_external(ctx, "__slimcc_emutls_get_address", (void *)__slimcc_emutls_get_address);
 }
