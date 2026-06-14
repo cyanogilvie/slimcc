@@ -2241,6 +2241,22 @@ int codegen(Obj *prog, FILE *out_file) {
 // Module lifecycle (used by libslimcc.c)
 //
 
+// Free the module-lifetime symbol table (and its SymItem values) and the
+// function-lifetime label map. Called at the end of each compile via reset_all
+// so this state is not retained idle until the next compile; codegen_mir_begin
+// also calls it defensively in case a prior compile ended abnormally.
+void codegen_mir_reset(void) {
+  for (int32_t i = 0; i < sym_items.capacity; i++) {
+    HashEntry *ent = &sym_items.buckets[i];
+    if (ent->key && ent->key != TOMBSTONE)
+      free(ent->val);
+  }
+  free(sym_items.buckets);
+  sym_items = (HashMap){0};
+  free(label_map.buckets);
+  label_map = (HashMap){0};
+}
+
 void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {
   mc = ctx;
   cur_mod = MIR_new_module(mc, module_name);
@@ -2257,15 +2273,7 @@ void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {
   memset(bitint_items, 0, sizeof(bitint_items));
   memset(bitint_protos, 0, sizeof(bitint_protos));
 
-  for (int32_t i = 0; i < sym_items.capacity; i++) {
-    HashEntry *ent = &sym_items.buckets[i];
-    if (ent->key && ent->key != TOMBSTONE)
-      free(ent->val);
-  }
-  free(sym_items.buckets);
-  sym_items = (HashMap){0};
-  free(label_map.buckets);
-  label_map = (HashMap){0};
+  codegen_mir_reset();
 }
 
 MIR_module_t codegen_mir_result(void) {

@@ -16,4 +16,8 @@ MIR_module_t codegen_mir_result(void);
 // MIR errors; the caller's error handler must tolerate re-entry.
 void codegen_mir_abort(void);
 
+// Free the backend's module-lifetime symbol table and label map. Called at the
+// end of each compile (via reset_all) so it is not retained between compiles.
+void codegen_mir_reset(void);
+
 #endif

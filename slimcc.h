@@ -203,6 +203,7 @@ char *arena_strdup(Arena *arena, const char *str);
 char *arena_copy_string(Arena *arena, const char *src, size_t len);
 void arena_on(Arena *arena);
 void arena_off(Arena *arena);
+void arena_free_pools(void);
 void *arena_calloc(Arena *a, size_t sz);
 void *arena_malloc(Arena *a, size_t sz);
 

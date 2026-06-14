@@ -21,6 +21,19 @@ bool check_mem_usage(void) {
   return stat.ru_maxrss > FREE_THRESHOLD;
 }
 
+// Free the recycled-pool freelist. arena_off (when not eagerly freeing) keeps
+// emptied pools here for reuse across compilations rather than returning them
+// to the C allocator; this releases them for good. Intended for a final
+// library-mode shutdown — after it, the freelist simply refills on demand.
+void arena_free_pools(void) {
+  for (Pool *p = pool_freelist; p;) {
+    Pool *tmp = p;
+    p = p->next;
+    free(tmp);
+  }
+  pool_freelist = NULL;
+}
+
 static Pool *new_pool(void) {
   Pool *p;
   if (pool_freelist) {

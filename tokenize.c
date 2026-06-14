@@ -634,7 +634,10 @@ static const char *string_literal_end(const char *p) {
 
 static Token *read_string_literal(const char *start, const char *quote, Type *ty) {
   const char *end = string_literal_end(quote + 1);
-  char *buf = calloc(1, end - quote);
+  // cc1_arena (live through parse + codegen, freed per compile) rather than a
+  // bare malloc: tok->str outlives tokenization but not the compile, and a raw
+  // calloc here leaked under libslimcc's compile churn.
+  char *buf = arena_calloc(&cc1_arena, end - quote);
   int len = 0;
   bool invalid = false;
 
@@ -653,10 +656,8 @@ static Token *read_string_literal(const char *start, const char *quote, Type *ty
     }
     buf[len++] = *p++;
   }
-  if (invalid) {
-    free(buf);
+  if (invalid)
     return new_token(TK_INVALID, start, end + 1);
-  }
   Token *tok = new_token(TK_STR, start, end + 1);
   tok->ty = array_of(ty, len + 1);
   tok->str = buf;
@@ -672,7 +673,7 @@ static Token *read_string_literal(const char *start, const char *quote, Type *ty
 // is called a "surrogate pair".
 static Token *read_utf16_string_literal(const char *start, const char *quote) {
   const char *end = string_literal_end(quote + 1);
-  uint16_t *buf = calloc(2, end - start);
+  uint16_t *buf = arena_calloc(&cc1_arena, 2 * (end - start)); // freed per compile (see read_string_literal)
   int len = 0;
   bool invalid = false;
 
@@ -697,10 +698,8 @@ static Token *read_utf16_string_literal(const char *start, const char *quote) {
     }
     invalid = true;
   }
-  if (invalid) {
-    free(buf);
+  if (invalid)
     return new_token(TK_INVALID, start, end + 1);
-  }
   Token *tok = new_token(TK_STR, start, end + 1);
   tok->ty = array_of(ty_char16_t, len + 1);
   tok->str = (char *)buf;
@@ -713,7 +712,7 @@ static Token *read_utf16_string_literal(const char *start, const char *quote) {
 // encoded in 4 bytes.
 static Token *read_utf32_string_literal(const char *start, const char *quote, Type *ty) {
   const char *end = string_literal_end(quote + 1);
-  uint32_t *buf = calloc(4, end - quote);
+  uint32_t *buf = arena_calloc(&cc1_arena, 4 * (end - quote)); // freed per compile (see read_string_literal)
   int len = 0;
   bool invalid = false;
 
@@ -723,10 +722,8 @@ static Token *read_utf32_string_literal(const char *start, const char *quote, Ty
     else
       buf[len++] = decode_utf8(&p, p);
   }
-  if (invalid) {
-    free(buf);
+  if (invalid)
     return new_token(TK_INVALID, start, end + 1);
-  }
   Token *tok = new_token(TK_STR, start, end + 1);
   tok->ty = array_of(ty, len + 1);
   tok->str = (char *)buf;

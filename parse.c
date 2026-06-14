@@ -174,8 +174,15 @@ struct FuncContext {
 
 bool is_redecl_context;
 
-static Obj *globals = &(Obj){0};
-static Scope *scope = &(Scope){0};
+// The file scope and global list head live in named statics (not anonymous
+// compound literals) so parse_reset can recognise them — `scope == &scope_init`
+// must hold from the very first compile, otherwise the first compile's file
+// scope (an unnamed literal) escapes parse_reset's free and its vars/tags maps
+// leak. Matters for library mode, where parse_reset runs after each compile.
+static Obj globals_init;
+static Scope scope_init;
+static Obj *globals = &globals_init;
+static Scope *scope = &scope_init;
 static HashMap symbols;
 static FuncContext *fnctx;
 static bool *eval_recover;
@@ -266,11 +273,50 @@ static void enter_tmp_scope(void) {
   scope->is_temporary = true;
 }
 
-static bool leave_scope(void) {
-  if (fnctx) {
-    free(scope->vars.buckets);
-    free(scope->tags.buckets);
+// Free a scope's heap-allocated vars/tags hashmap bucket arrays (the Scope
+// struct itself is arena-allocated). Idempotent: zeroes the maps so a second
+// call (a scope freed both at leave and at the per-declaration sweep) is a
+// harmless free(NULL).
+static void free_scope_maps(Scope *sc) {
+  free(sc->vars.buckets);
+  free(sc->tags.buckets);
+  sc->vars = (HashMap){0};
+  sc->tags = (HashMap){0};
+}
+
+// Scopes left while no function body is being parsed (fnctx == NULL) — function
+// prototype parameter scopes, struct/union/enum scopes — cannot be freed at
+// leave_scope: a function *definition*'s parameter scope is also left with
+// fnctx == NULL but is then re-entered via ty->scopes in func_definition to
+// parse the body. So collect every such scope and free its maps at the end of
+// the enclosing global declaration, just before its AST arena is discarded, by
+// which point all of them (including any re-entered-and-already-freed
+// definition scope) are permanently dead. Without this the prototype/tag scope
+// maps leaked — invisible to the one-shot CLI, but unbounded under libslimcc
+// compile churn.
+static Scope **pending_scope_maps;
+static int pending_scope_maps_len, pending_scope_maps_cap;
+
+static void collect_scope_maps(Scope *sc) {
+  if (pending_scope_maps_len == pending_scope_maps_cap) {
+    pending_scope_maps_cap = pending_scope_maps_cap ? pending_scope_maps_cap * 2 : 8;
+    pending_scope_maps = realloc(pending_scope_maps,
+                                 pending_scope_maps_cap * sizeof *pending_scope_maps);
   }
+  pending_scope_maps[pending_scope_maps_len++] = sc;
+}
+
+static void flush_pending_scope_maps(void) {
+  for (int i = 0; i < pending_scope_maps_len; i++)
+    free_scope_maps(pending_scope_maps[i]);
+  pending_scope_maps_len = 0;
+}
+
+static bool leave_scope(void) {
+  if (fnctx)
+    free_scope_maps(scope);
+  else
+    collect_scope_maps(scope);
   bool has_label = scope->has_label;
   scope = scope->parent;
   scope->has_label |= has_label;
@@ -6060,6 +6106,7 @@ Obj *parse(Token *tok) {
 
     if (tok->kind == TK_PRAGMA) {
       pragma_pack(&tok, tok);
+      flush_pending_scope_maps();
       arena_off(&ast_arena);
       continue;
     }
@@ -6075,6 +6122,7 @@ Obj *parse(Token *tok) {
       globals = last;
       last->next = NULL;
 
+      flush_pending_scope_maps();
       arena_off(&ast_arena);
       continue;
     }
@@ -6085,6 +6133,7 @@ Obj *parse(Token *tok) {
     if (tok->kind == TK_SEMI) {
       chk_inline(&attr, tok);
       tok = tok->next;
+      flush_pending_scope_maps();
       arena_off(&ast_arena);
       continue;
     }
@@ -6092,11 +6141,13 @@ Obj *parse(Token *tok) {
     if (attr.strg & SC_TYPEDEF) {
       chk_inline(&attr, tok);
       parse_typedef(&tok, tok, basety, &attr);
+      flush_pending_scope_maps();
       arena_off(&ast_arena);
       continue;
     }
 
     global_declaration(&tok, tok, basety, &attr);
+    flush_pending_scope_maps();
     arena_off(&ast_arena);
   }
 
@@ -6107,6 +6158,9 @@ Obj *parse(Token *tok) {
 // unwind. Must run before the AST arena is recycled - the nested Scope
 // structs live there, so parse_reset (which runs after) cannot reach them.
 void parse_free_scopes(void) {
+  // Error unwind: the active scope chain plus any scopes collected during the
+  // in-flight declaration are all still in the (not-yet-discarded) AST arena.
+  flush_pending_scope_maps();
   for (Scope *sc = scope; sc; sc = sc->parent) {
     free(sc->vars.buckets);
     free(sc->tags.buckets);
@@ -6119,11 +6173,10 @@ void parse_free_scopes(void) {
 // (library mode). Symbol storage is owned by the arenas; the bucket arrays
 // are freed here.
 void parse_reset(void) {
-  static Obj globals_init;
-  static Scope scope_init;
   // Free the file scope's heap-allocated symbol maps. After an error
   // unwind `scope` may be a nested scope in the recycled AST arena, in
-  // which case nothing can be safely touched.
+  // which case nothing can be safely touched. `scope` starts out as
+  // &scope_init (see its definition), so this also covers the first compile.
   if (scope == &scope_init) {
     free(scope->vars.buckets);
     free(scope->tags.buckets);
@@ -6134,6 +6187,11 @@ void parse_reset(void) {
   scope = &scope_init;
   free(symbols.buckets);
   symbols = (HashMap){0};
+  // The pending-scope sweep list itself (its bucket maps were already flushed
+  // by parse() on success or parse_free_scopes() on error).
+  free(pending_scope_maps);
+  pending_scope_maps = NULL;
+  pending_scope_maps_len = pending_scope_maps_cap = 0;
   fnctx = NULL;
   eval_recover = NULL;
   jump_ctx = NULL;
