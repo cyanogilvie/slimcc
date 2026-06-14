@@ -159,6 +159,7 @@ static void reset_all(void) {
   preprocess_reset();
   parse_reset();
   type_reset();
+  codegen_mir_reset();
   free(include_paths.data);
   free(iquote_paths.data);
   free(display_files.data);
@@ -203,7 +204,12 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
     *errmsg = NULL;
 
   slimcc_lib_mode = true;
-  reset_all();
+  // Per-compile state is cleared eagerly at the end of each compile (success
+  // and failure paths both finish with reset_all), so on entry it is already
+  // clean — the very first call starts from zero-initialized globals. This
+  // avoids retaining one compile's worth of token pool / file contents / maps
+  // idle between compiles (or until shutdown), which matters on memory-
+  // constrained hosts.
 
   diag_buf = NULL;
   slimcc_diag_file = open_memstream(&diag_buf, &diag_len);
@@ -287,6 +293,10 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   slimcc_diag_file = NULL;
   free(diag_buf); // warnings only; surfaced via a callback in a later version
   diag_buf = NULL;
+  // Free this compile's per-compile state now rather than retaining it until
+  // the next compile. The finished module lives in the caller's ctx and shares
+  // nothing with it. (The error path above resets symmetrically before NULL.)
+  reset_all();
   return mod;
 }
 
@@ -317,4 +327,15 @@ void slimcc_register_helpers(MIR_context_t ctx) {
   MIR_load_external(ctx, "__slimcc_jit_exch_8", (void *)__slimcc_jit_exch_8);
   MIR_load_external(ctx, "__slimcc_jit_fence", (void *)__slimcc_jit_fence);
   MIR_load_external(ctx, "__slimcc_emutls_get_address", (void *)__slimcc_emutls_get_address);
+}
+
+void slimcc_shutdown(void) {
+  // Per-compile state is already freed at the end of each compile; the one
+  // thing that persists across compiles is the arena pool freelist that
+  // arena_off keeps for reuse. Release it (plus a defensive reset_all() in case
+  // shutdown is reached in an unexpected state). Intended for a final
+  // library-mode shutdown (an embedder unloaded from a host that outlives it);
+  // compiling again afterwards simply rebuilds everything on demand.
+  reset_all();
+  arena_free_pools();
 }

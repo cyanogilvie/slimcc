@@ -51,4 +51,11 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 // your own import resolver instead.
 void slimcc_register_helpers(MIR_context_t ctx);
 
+// Release libslimcc's process-global state (the cross-compilation arena pool
+// freelist). Optional: call once when unloading the library from a host that
+// outlives it, so nothing is left allocated. Not required before process exit.
+// Safe to keep compiling afterwards (state is lazily rebuilt). Serialize with
+// slimcc_compile like everything else.
+void slimcc_shutdown(void);
+
 #endif
