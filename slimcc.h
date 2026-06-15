@@ -480,6 +480,17 @@ void undef_macro(const char *name);
 void dump_defines(FILE *out);
 Token *preprocess(const char *file, StringArray *incls, StringArray *macros);
 Token *prepare_parse(Token *tok);
+
+// Precompiled-preamble (PCH) snapshot engine. pp_snapshot() deep-copies the
+// current macro/guard tables plus a preprocessed token chain into `arena`
+// (which the caller keeps alive); pp_install() installs per-compile copies of
+// that macro/guard state into the live preprocessor globals and returns a
+// fresh, mutable copy of the preamble token chain to splice ahead of the body.
+// See libslimcc's slimcc_pch_*.
+typedef struct PchState PchState;
+PchState *pp_snapshot(Arena *arena, Token *preamble_toks);
+Token *pp_install(const PchState *s);
+void pp_free_state(PchState *s);
 Token *skip_line(Token *tok);
 void preprocess_reset(void);
 extern Token *last_alloc_tok;

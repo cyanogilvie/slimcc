@@ -2214,6 +2214,217 @@ Token *prepare_parse(Token *tok) {
   return tok;
 }
 
+//
+// Precompiled-preamble (PCH) snapshot engine.
+//
+// A PCH captures the preprocessor state reached after a fixed preamble (the
+// macro/guard tables plus the preamble's preprocessed token chain), so a later
+// compile can splice it in instead of re-tokenizing the whole header closure.
+// The snapshot is taken at the post-preprocess() checkpoint: tokens are still
+// PP-form (no Type/string-value attached yet — those are produced later by
+// preprocess3/parse), so only Token + File + raw text need copying, never the
+// type graph.
+//
+struct PchState {
+  Token *toks;            // preamble token chain (PP-form, EOF stripped)
+  HashMap macros;         // name -> Macro*, bodies all in the pch arena
+  HashMap pragma_once;    // realpath -> (void*)1
+  HashMap include_guards; // path -> guard name
+  char **filebufs;        // malloc'd File content copies (too big for the arena)
+  int n_filebufs, cap_filebufs;
+};
+
+// While copying a token chain into a persistent arena, each distinct source
+// File is copied once (struct + contents) so token loc pointers can be rebased
+// into the copy and survive the per-compile reset.
+typedef struct {
+  File *old, *neu;
+  const char *old_c, *new_c;
+  size_t clen;
+} FileMap;
+typedef struct {
+  FileMap *data;
+  int len, cap;
+} FileMapList;
+
+static File *pch_remap_file(Arena *a, PchState *s, FileMapList *fm, File *f,
+                            const char **oc, const char **nc, size_t *clen) {
+  for (int i = 0; i < fm->len; i++)
+    if (fm->data[i].old == f) {
+      *oc = fm->data[i].old_c, *nc = fm->data[i].new_c, *clen = fm->data[i].clen;
+      return fm->data[i].neu;
+    }
+  File *nf = arena_malloc(a, sizeof *nf);
+  *nf = *f;
+  nf->name = f->name ? arena_strdup(a, f->name) : NULL;
+  size_t cl = f->contents ? strlen(f->contents) : 0;
+  char *ncs = NULL;
+  if (f->contents) {
+    // File contents can far exceed the arena's per-object cap, so they live in
+    // malloc'd buffers owned by the PchState (freed in pp_free_state).
+    ncs = memcpy(malloc(cl + 1), f->contents, cl + 1);
+    if (s->n_filebufs == s->cap_filebufs) {
+      s->cap_filebufs = s->cap_filebufs ? s->cap_filebufs * 2 : 16;
+      s->filebufs = realloc(s->filebufs, s->cap_filebufs * sizeof *s->filebufs);
+    }
+    s->filebufs[s->n_filebufs++] = ncs;
+  }
+  nf->contents = ncs;
+  if (fm->len == fm->cap) {
+    fm->cap = fm->cap ? fm->cap * 2 : 8;
+    fm->data = realloc(fm->data, fm->cap * sizeof *fm->data);
+  }
+  fm->data[fm->len++] = (FileMap){f, nf, f->contents, ncs, cl};
+  *oc = f->contents, *nc = ncs, *clen = cl;
+  return nf;
+}
+
+// Deep-copy a PP-form token chain into arena `a`. Expansion-only links
+// (origin/attr_next/alloc_next) are cleared; loc is rebased into the copied
+// file contents, or, for synthesized tokens whose loc is not within a file
+// buffer (e.g. produced by ## pasting), the token's own text is copied.
+// drop_eof: the main preamble chain drops its trailing EOF (the spliced body
+// supplies the terminating one); macro bodies/params keep theirs, since subst
+// iterates them up to TK_EOF.
+static Token *pch_copy_toks(Arena *a, PchState *s, FileMapList *fm, Token *src, bool drop_eof) {
+  Token head = {0};
+  Token *cur = &head;
+  for (Token *t = src; t && !(drop_eof && t->kind == TK_EOF); t = t->next) {
+    bool was_eof = t->kind == TK_EOF;
+    Token *n = arena_malloc(a, sizeof *n);
+    *n = *t;
+    n->next = n->origin = n->attr_next = n->alloc_next = NULL;
+    if (t->loc) {
+      const char *oc = NULL, *nc = NULL;
+      size_t cl = 0;
+      if (t->file)
+        n->file = pch_remap_file(a, s, fm, t->file, &oc, &nc, &cl);
+      if (oc && t->loc >= oc && (size_t)(t->loc - oc) <= cl)
+        n->loc = nc + (t->loc - oc);
+      else
+        n->loc = arena_copy_string(a, t->loc, t->len);
+    }
+    // String-literal tokens (only ones already decoded at this checkpoint —
+    // they were tokenized when their macro was #defined) carry ty (an array
+    // type) and str (the decoded bytes) pointing into per-compile storage that
+    // is freed after the snapshot. Copy both into the pch arena so the parser
+    // sees valid type/value, not freed memory. (Numbers are still PP_NUM here,
+    // decoded later from loc; char constants' ty is a global singleton.)
+    if (n->kind == TK_STR && n->ty) {
+      Type *nt = arena_malloc(a, sizeof *nt);
+      *nt = *n->ty; // shallow: base is a global element type (ty_char, ...)
+      n->ty = nt;
+      if (n->str && nt->size > 0)
+        n->str = memcpy(arena_malloc(a, nt->size), n->str, nt->size);
+    }
+    cur = cur->next = n;
+    if (was_eof)
+      break; // copied the terminator; nothing valid follows it
+  }
+  return head.next;
+}
+
+// Copy a string-keyed map (pragma_once / include_guards) into arena `a`,
+// duplicating keys (and the guard-name values for include_guards).
+static void pch_copy_strmap(Arena *a, HashMap *dst, HashMap *src, bool val_is_str) {
+  for (int i = 0; i < src->capacity; i++) {
+    HashEntry *e = &src->buckets[i];
+    if (!e->key || e->key == TOMBSTONE)
+      continue;
+    char *k = arena_copy_string(a, e->key, e->keylen);
+    void *v = val_is_str && e->val ? arena_strdup(a, e->val) : e->val;
+    hashmap_put2(dst, k, e->keylen, v);
+  }
+}
+
+PchState *pp_snapshot(Arena *arena, Token *preamble_toks) {
+  PchState *s = calloc(1, sizeof *s);
+  FileMapList fm = {0};
+  s->toks = pch_copy_toks(arena, s, &fm, preamble_toks, /*drop_eof*/ true);
+
+  for (int i = 0; i < macros.capacity; i++) {
+    HashEntry *e = &macros.buckets[i];
+    if (!e->key || e->key == TOMBSTONE || !e->val)
+      continue;
+    Macro *om = e->val, *nm = arena_malloc(arena, sizeof *nm);
+    *nm = *om;
+    nm->body = om->body ? pch_copy_toks(arena, s, &fm, om->body, false) : NULL;
+    nm->params = om->params ? pch_copy_toks(arena, s, &fm, om->params, false) : NULL;
+    nm->stop_tok = NULL;
+    nm->locked_next = NULL;
+    nm->is_locked = false;
+    char *k = arena_copy_string(arena, e->key, e->keylen);
+    hashmap_put2(&s->macros, k, e->keylen, nm);
+  }
+  pch_copy_strmap(arena, &s->pragma_once, &pragma_once, false);
+  pch_copy_strmap(arena, &s->include_guards, &include_guards, true);
+  free(fm.data);
+  return s;
+}
+
+void pp_free_state(PchState *s) {
+  if (!s)
+    return;
+  for (int i = 0; i < s->n_filebufs; i++)
+    free(s->filebufs[i]);
+  free(s->filebufs);
+  free(s->macros.buckets);
+  free(s->pragma_once.buckets);
+  free(s->include_guards.buckets);
+  free(s);
+}
+
+// Per-compile copy of the snapshot's token chain, using slimcc's own
+// copy_token so the result is an ordinary tok_alloc'd token that every later
+// freeing path (prepare_parse's pre-preprocess3 sweep, preprocess3's
+// attribute/pragma to_freelist, parse's free_parsed_tok) handles correctly.
+// loc/file stay shared with the persistent snapshot in the pch arena. Marked
+// is_root, exactly like a finalized stream token, so the pre-preprocess3 sweep
+// keeps it.
+static Token *pch_instantiate_toks(Token *src) {
+  Token head = {0};
+  Token *cur = &head;
+  for (Token *t = src; t; t = t->next) {
+    Token *n = copy_token(t);
+    n->next = NULL;
+    n->is_root = true;
+    cur = cur->next = n;
+  }
+  return head.next;
+}
+
+static void pch_install_strmap(HashMap *dst, const HashMap *src) {
+  for (int i = 0; i < src->capacity; i++) {
+    const HashEntry *e = &src->buckets[i];
+    if (!e->key || e->key == TOMBSTONE)
+      continue;
+    hashmap_put2(dst, e->key, e->keylen, e->val); // keys/vals live in pch arena
+  }
+}
+
+Token *pp_install(const PchState *s) {
+  // Per-compile Macro copies so expansion's locking (is_locked/locked_next/
+  // stop_tok) and any #undef touch only this compile's table; bodies/params
+  // are shared read-only from the pch arena.
+  macros = (HashMap){0};
+  for (int i = 0; i < s->macros.capacity; i++) {
+    const HashEntry *e = &s->macros.buckets[i];
+    if (!e->key || e->key == TOMBSTONE || !e->val)
+      continue;
+    Macro *cm = arena_malloc(&pp_arena, sizeof *cm);
+    *cm = *(Macro *)e->val;
+    cm->stop_tok = NULL;
+    cm->locked_next = NULL;
+    cm->is_locked = false;
+    hashmap_put2(&macros, e->key, e->keylen, cm);
+  }
+  pragma_once = (HashMap){0};
+  include_guards = (HashMap){0};
+  pch_install_strmap(&pragma_once, &s->pragma_once);
+  pch_install_strmap(&include_guards, &s->include_guards);
+  return pch_instantiate_toks(s->toks);
+}
+
 // Reset all preprocessor state so a new compilation can run in the same
 // process (library mode). Storage reachable from the maps is owned by the
 // arenas or freed in prepare_parse; remaining buckets are freed here.

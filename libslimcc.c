@@ -101,8 +101,105 @@ bool ignore_missing_dep(const char *path, const char *filename, Token *tok) {
   return false;
 }
 
+//
+// Input-file dependency recording (for precompiled-preamble validation).
+// add_dep_file() is already invoked by the preprocessor for every file it
+// pulls in (the base file, -include files, and each #include'd header). When
+// a recorder is active it captures the path, mtime and size of every real
+// (non-vfile) file, so a cached preamble can later be revalidated against the
+// filesystem. Inactive (dep_rec == NULL) during ordinary compiles.
+//
+typedef struct {
+  char *path;
+  struct timespec mtim;
+  off_t size;
+} DepEntry;
+
+typedef struct {
+  DepEntry *data;
+  int len, cap;
+} DepList;
+
+static DepList *dep_rec;
+
+static void dep_list_free(DepList *d) {
+  if (!d)
+    return;
+  for (int i = 0; i < d->len; i++)
+    free(d->data[i].path);
+  free(d->data);
+}
+
+// True iff every recorded file still exists with the same mtime and size.
+static bool dep_list_unchanged(const DepList *d) {
+  for (int i = 0; i < d->len; i++) {
+    struct stat st;
+    if (stat(d->data[i].path, &st))
+      return false;
+    if (st.st_mtim.tv_sec != d->data[i].mtim.tv_sec ||
+        st.st_mtim.tv_nsec != d->data[i].mtim.tv_nsec ||
+        st.st_size != d->data[i].size)
+      return false;
+  }
+  return true;
+}
+
 void add_dep_file(const char *path, bool is_sys) {
-  (void)path, (void)is_sys;
+  (void)is_sys;
+  if (!dep_rec || slimcc_vfile_get(path))
+    return; // recording off, or an in-memory file with no on-disk mtime
+  for (int i = 0; i < dep_rec->len; i++)
+    if (!strcmp(dep_rec->data[i].path, path))
+      return; // a guard-less header included twice records once
+  struct stat st;
+  if (stat(path, &st))
+    return; // unreadable now: skip; a genuine miss is caught at revalidation
+  if (dep_rec->len == dep_rec->cap) {
+    dep_rec->cap = dep_rec->cap ? dep_rec->cap * 2 : 16;
+    dep_rec->data = realloc(dep_rec->data, dep_rec->cap * sizeof *dep_rec->data);
+  }
+  DepEntry *e = &dep_rec->data[dep_rec->len++];
+  e->path = strdup(path);
+  e->mtim = st.st_mtim;
+  e->size = st.st_size;
+}
+
+//
+// Precompiled preamble (header cache). slimcc_pch_create captures the cache
+// key, the validated file-dependency set, and a snapshot (via pp_snapshot) of
+// the preamble's macro/guard tables + preprocessed token chain; slimcc_compile
+// installs that snapshot to skip re-tokenizing the header closure.
+//
+struct slimcc_pch {
+  uint64_t key;   // hash of (defines, include paths) this pch was built with
+  char *preamble; // the preamble text, for the inline fallback path
+  DepList deps;   // real files read while building, for mtime revalidation
+  Arena arena;    // persistent storage for pp (kept alive for the pch's life)
+  PchState *pp;   // snapshotted macro/guard tables + preamble token chain
+};
+
+static uint64_t fnv1a_str(uint64_t h, const char *s) {
+  for (; *s; s++) {
+    h ^= (unsigned char)*s;
+    h *= 0x100000001b3ull;
+  }
+  return (h ^ ',') * 0x100000001b3ull; // separator so {"ab"} != {"a","b"}
+}
+
+// The key only guards option compatibility (a compile must use the same
+// defines/include paths the pch was built with); the preamble text is the
+// caller's responsibility to keep paired, and header edits are caught by the
+// mtime check. Hashed in the given order — a reorder just misses, never a
+// false hit. slimcc_compile recomputes this from opt and compares.
+static uint64_t pch_compute_key(const slimcc_options *opt) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  if (opt) {
+    for (int i = 0; i < opt->n_defines; i++)
+      h = fnv1a_str(h, opt->defines[i]);
+    for (int i = 0; i < opt->n_include_paths; i++)
+      h = fnv1a_str(h, opt->include_paths[i]);
+  }
+  return h;
 }
 
 void add_include_path(StringArray *arr, const char *s) {
@@ -266,14 +363,58 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 
   codegen_mir_begin(scratch, name);
 
-  init_macros();
-  platform_init_cc1();
-  lib_macros();
-  if (opt)
-    for (int i = 0; i < opt->n_defines; i++)
-      define_macro_cli(opt->defines[i]);
+  const slimcc_pch *pch = opt ? opt->pch : NULL;
+  bool use_pch = pch && pch->key == pch_compute_key(opt) && slimcc_pch_valid(pch);
+  Token *tok;
 
-  Token *tok = preprocess(name, &(StringArray){0}, &(StringArray){0});
+  if (use_pch) {
+    // Fast path: the preamble's macros, include guards and preprocessed token
+    // chain come from the pch; only the cdef body (source) is tokenized here,
+    // then spliced after the preamble. init_macros/platform_init_cc1/lib_macros
+    // and the CLI defines are all already baked into the pch (the key check
+    // guarantees matching defines/paths). The non-macro target type globals
+    // (ty_size_t, enum_ty, ...) that platform_init_cc1 sets via init_ty_lp64
+    // are process-persistent (type_reset doesn't clear them) and were set when
+    // the pch was built, so they need no re-init here — and must NOT be, since
+    // re-running init_ty_lp64 would re-#define its macros and churn the table.
+    Token *pre = pp_install(pch->pp);
+    Token *body = preprocess(name, &(StringArray){0}, &(StringArray){0});
+    if (pre) {
+      Token *t = pre;
+      while (t->next)
+        t = t->next;
+      t->next = body;
+      tok = pre;
+    } else {
+      tok = body;
+    }
+  } else {
+    init_macros();
+    platform_init_cc1();
+    lib_macros();
+    if (opt)
+      for (int i = 0; i < opt->n_defines; i++)
+        define_macro_cli(opt->defines[i]);
+
+    if (pch) {
+      // A pch was supplied but is unusable (stale headers or mismatched
+      // options): fall back to compiling preamble+body as one source, so the
+      // body still sees the headers. A pch is purely an optimization, never a
+      // correctness dependency. (tokenize copies the vfile contents up front,
+      // so freeing `combined` right after preprocess is safe; a compile error
+      // longjmps past the free, an accepted leak on this doubly-rare path.)
+      size_t pl = strlen(pch->preamble), sl = strlen(source);
+      char *combined = malloc(pl + 1 + sl + 1);
+      memcpy(combined, pch->preamble, pl);
+      combined[pl] = '\n';
+      memcpy(combined + pl + 1, source, sl + 1);
+      slimcc_vfile_add(name, combined); // overwrites the body-only registration
+      tok = preprocess(name, &(StringArray){0}, &(StringArray){0});
+      free(combined);
+    } else {
+      tok = preprocess(name, &(StringArray){0}, &(StringArray){0});
+    }
+  }
   tok = prepare_parse(tok);
   arena_off(&pp_arena);
 
@@ -298,6 +439,103 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   // nothing with it. (The error path above resets symmetrically before NULL.)
   reset_all();
   return mod;
+}
+
+slimcc_pch *slimcc_pch_create(const char *preamble, const slimcc_options *opt,
+                              char **errmsg) {
+  if (errmsg)
+    *errmsg = NULL;
+  slimcc_lib_mode = true;
+
+  diag_buf = NULL;
+  slimcc_diag_file = open_memstream(&diag_buf, &diag_len);
+
+  DepList deps = {0};
+
+  // Preprocess-only: no MIR context or codegen, so a preprocessor error just
+  // unwinds here (mirrors slimcc_compile's recovery, minus the codegen stages).
+  if (setjmp(compile_jmp)) {
+    compile_active = false;
+    dep_rec = NULL;
+    parse_free_scopes();
+    arenas_off();
+    fclose(slimcc_diag_file);
+    slimcc_diag_file = NULL;
+    if (errmsg)
+      *errmsg = diag_buf;
+    else
+      free(diag_buf);
+    diag_buf = NULL;
+    dep_list_free(&deps);
+    reset_all();
+    return NULL;
+  }
+  compile_active = true;
+
+  static const char *pch_name = "<preamble>";
+  slimcc_vfile_add(pch_name, preamble);
+  register_embedded_headers();
+  if (opt) {
+    for (int i = 0; i < opt->n_vfiles; i++)
+      slimcc_vfile_add(opt->vfiles[i].name, opt->vfiles[i].contents);
+    for (int i = 0; i < opt->n_include_paths; i++)
+      add_include_path(&include_paths, opt->include_paths[i]);
+  }
+
+  arena_on(&cc1_arena);
+  arena_on(&pp_arena);
+
+  init_macros();
+  platform_init_cc1();
+  lib_macros();
+  if (opt)
+    for (int i = 0; i < opt->n_defines; i++)
+      define_macro_cli(opt->defines[i]);
+
+  // Every real file opened here is recorded (with mtime+size) via add_dep_file.
+  // The macro table + token stream are fully populated once preprocess returns
+  // and before prepare_parse would tear the macro table down — that is the
+  // checkpoint we snapshot into the pch-owned arena.
+  dep_rec = &deps;
+  Token *pre = preprocess(pch_name, &(StringArray){0}, &(StringArray){0});
+  dep_rec = NULL;
+
+  slimcc_pch *pch = calloc(1, sizeof *pch);
+  arena_on(&pch->arena); // never arena_off'd; freed by slimcc_pch_free
+  pch->pp = pp_snapshot(&pch->arena, pre);
+
+  arena_off(&pp_arena);
+  arena_off(&cc1_arena);
+
+  compile_active = false;
+  fclose(slimcc_diag_file);
+  slimcc_diag_file = NULL;
+  free(diag_buf);
+  diag_buf = NULL;
+
+  pch->key = pch_compute_key(opt);
+  pch->preamble = strdup(preamble);
+  pch->deps = deps; // ownership transferred to the pch
+  reset_all();
+  return pch;
+}
+
+bool slimcc_pch_valid(const slimcc_pch *pch) {
+  return pch && dep_list_unchanged(&pch->deps);
+}
+
+int slimcc_pch_nfiles(const slimcc_pch *pch) {
+  return pch ? pch->deps.len : 0;
+}
+
+void slimcc_pch_free(slimcc_pch *pch) {
+  if (!pch)
+    return;
+  pp_free_state(pch->pp);
+  arena_off(&pch->arena); // release/recycle the persistent pool chain
+  free(pch->preamble);
+  dep_list_free(&pch->deps);
+  free(pch);
 }
 
 // Atomic helpers from slimcc-mir-helpers.c.
