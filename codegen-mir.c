@@ -1798,6 +1798,12 @@ static void gen_return(Node *node) {
 }
 
 static void gen_stmt(Node *node) {
+  // In debug mode, stamp this statement's source location onto the insns it
+  // emits so MIR can build a line map (DWARF .debug_line). Recursive gen_stmt
+  // calls restamp per nested statement, giving line granularity.
+  if (opt_g && node->tok && node->tok->file)
+    MIR_set_source_loc(mc, slimcc_debug_intern_file(node->tok->file->name),
+                       node->tok->line_no);
   switch (node->kind) {
   case ND_NULL_STMT:
     return;
@@ -2003,6 +2009,13 @@ void emit_text(Obj *fn) {
 
   fn->output = arena_calloc(&cc1_arena, sizeof(FuncObj));
   fn->output->item = fn_item;
+
+  // Attribute the prologue (local allocas + parameter spills below) to the
+  // function's opening line, so `break func` / its entry maps there rather
+  // than inheriting a later statement's line.
+  if (opt_g && fn->body && fn->body->tok && fn->body->tok->file)
+    MIR_set_source_loc(mc, slimcc_debug_intern_file(fn->body->tok->file->name),
+                       fn->body->tok->line_no);
 
   // Slots for all locals (parameters included), then spill the incoming
   // arguments into their slots. A block argument's register holds the
