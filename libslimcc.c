@@ -7,6 +7,7 @@
 #include "codegen-mir.h"
 #include "libslimcc.h"
 #include <setjmp.h>
+#include <elf.h>
 
 //
 // Globals normally defined by main.c. Defaults follow the CLI driver
@@ -576,4 +577,170 @@ void slimcc_shutdown(void) {
   // compiling again afterwards simply rebuilds everything on demand.
   reset_all();
   arena_free_pools();
+}
+
+// --- JIT debug symbols (GDB JIT interface) -------------------------------
+
+// Host ELF machine for the emitted debug object. Both production targets are
+// little-endian; the GDB JIT consumer is always this same process, so the
+// object is naturally host-native.
+#if defined(__x86_64__)
+#define SLIMCC_ELF_MACHINE EM_X86_64
+#elif defined(__aarch64__)
+#define SLIMCC_ELF_MACHINE EM_AARCH64
+#elif defined(__riscv) && __riscv_xlen == 64
+#define SLIMCC_ELF_MACHINE EM_RISCV
+#elif defined(__powerpc64__)
+#define SLIMCC_ELF_MACHINE EM_PPC64
+#elif defined(__s390x__)
+#define SLIMCC_ELF_MACHINE EM_S390
+#else
+#define SLIMCC_ELF_MACHINE EM_NONE
+#endif
+
+static int debug_obj_fail(char **errmsg, const char *msg) {
+  if (errmsg) *errmsg = strdup(msg);
+  return -1;
+}
+
+int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
+                     size_t *size, char **errmsg) {
+  if (errmsg) *errmsg = NULL;
+  if (buf) *buf = NULL;
+  if (size) *size = 0;
+  if (nsyms < 0 || (nsyms > 0 && syms == NULL) || buf == NULL || size == NULL)
+    return debug_obj_fail(errmsg, "slimcc_debug_obj: invalid arguments");
+  if (SLIMCC_ELF_MACHINE == EM_NONE)
+    return debug_obj_fail(errmsg, "slimcc_debug_obj: unsupported host architecture");
+
+  // gdb's JIT reader only materializes symbols that fall inside an allocatable
+  // section of the registered object (a symtab-only/SHN_ABS object yields no
+  // usable symbols). So anchor every symbol to a single SHT_NOBITS .text
+  // section spanning their address range, and define each symbol relative to
+  // it (st_shndx = .text, st_value = addr - text_base). gdb places the section
+  // at sh_addr and reads the actual instruction bytes from inferior memory.
+  // Callers should therefore group symbols with nearby addresses (jitc emits
+  // one object per cdef context, whose code MIR keeps in one region).
+  uintptr_t lo = UINTPTR_MAX, hi = 0;
+  for (int i = 0; i < nsyms; i++) {
+    if (!syms[i].addr) continue;
+    uintptr_t a = (uintptr_t)syms[i].addr;
+    uintptr_t e = a + (syms[i].size ? syms[i].size : 1);
+    if (a < lo) lo = a;
+    if (e > hi) hi = e;
+  }
+  if (lo == UINTPTR_MAX) lo = hi = 0; // no addressed symbols
+  uintptr_t text_base = lo;
+  uint64_t text_size = hi > lo ? (uint64_t)(hi - lo) : 0;
+
+  // The symbol table carries a leading null symbol (index 0), then one symbol
+  // per input. Section layout: [0] null, [1] .text, [2] .symtab, [3] .strtab,
+  // [4] .shstrtab.
+  size_t nsym = (size_t)nsyms + 1;
+
+  // .strtab: a leading NUL, then each name NUL-terminated. Record each
+  // symbol's name offset as we go.
+  size_t strtab_size = 1;
+  for (int i = 0; i < nsyms; i++)
+    strtab_size += strlen(syms[i].name ? syms[i].name : "") + 1;
+
+  static const char shstr[] = "\0.text\0.symtab\0.strtab\0.shstrtab";
+  size_t shstrtab_size = sizeof(shstr); // includes the trailing NUL
+  // Offsets of each section name within shstr (counted from its leading NUL).
+  const Elf64_Word name_text = 1;
+  const Elf64_Word name_symtab = 7;
+  const Elf64_Word name_strtab = 15;
+  const Elf64_Word name_shstrtab = 23;
+
+  size_t off_ehdr = 0;
+  size_t off_symtab = (sizeof(Elf64_Ehdr) + 7) & ~(size_t)7; // 8-align symtab
+  size_t symtab_size = nsym * sizeof(Elf64_Sym);
+  size_t off_strtab = off_symtab + symtab_size;
+  size_t off_shstrtab = off_strtab + strtab_size;
+  size_t off_shdr = (off_shstrtab + shstrtab_size + 7) & ~(size_t)7;
+  size_t total = off_shdr + 5 * sizeof(Elf64_Shdr);
+
+  unsigned char *p = calloc(1, total);
+  if (!p) return debug_obj_fail(errmsg, "slimcc_debug_obj: out of memory");
+
+  // ELF header.
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)(p + off_ehdr);
+  eh->e_ident[EI_MAG0] = ELFMAG0;
+  eh->e_ident[EI_MAG1] = ELFMAG1;
+  eh->e_ident[EI_MAG2] = ELFMAG2;
+  eh->e_ident[EI_MAG3] = ELFMAG3;
+  eh->e_ident[EI_CLASS] = ELFCLASS64;
+  eh->e_ident[EI_DATA] = ELFDATA2LSB;
+  eh->e_ident[EI_VERSION] = EV_CURRENT;
+  eh->e_ident[EI_OSABI] = ELFOSABI_SYSV;
+  eh->e_type = ET_REL;
+  eh->e_machine = SLIMCC_ELF_MACHINE;
+  eh->e_version = EV_CURRENT;
+  eh->e_shoff = off_shdr;
+  eh->e_ehsize = sizeof(Elf64_Ehdr);
+  eh->e_shentsize = sizeof(Elf64_Shdr);
+  eh->e_shnum = 5;
+  eh->e_shstrndx = 4;
+
+  // Symbol table + string table (index 0 of each is the reserved null entry).
+  Elf64_Sym *st = (Elf64_Sym *)(p + off_symtab);
+  char *strtab = (char *)(p + off_strtab);
+  size_t stroff = 1; // [0] is the leading NUL
+  for (int i = 0; i < nsyms; i++) {
+    const char *nm = syms[i].name ? syms[i].name : "";
+    size_t len = strlen(nm) + 1;
+    memcpy(strtab + stroff, nm, len);
+    Elf64_Sym *s = &st[i + 1];
+    s->st_name = (Elf64_Word)stroff;
+    s->st_info = ELF64_ST_INFO(STB_GLOBAL, syms[i].is_func ? STT_FUNC : STT_OBJECT);
+    s->st_other = STV_DEFAULT;
+    if (syms[i].addr) {
+      s->st_shndx = 1; // .text — relative to the anchoring section
+      s->st_value = (Elf64_Addr)((uintptr_t)syms[i].addr - text_base);
+    } else {
+      s->st_shndx = SHN_UNDEF;
+      s->st_value = 0;
+    }
+    s->st_size = (Elf64_Xword)syms[i].size;
+    stroff += len;
+  }
+
+  // Section name string table.
+  memcpy(p + off_shstrtab, shstr, shstrtab_size);
+
+  // Section headers.
+  Elf64_Shdr *sh = (Elf64_Shdr *)(p + off_shdr);
+  // [1] .text — allocatable anchor; NOBITS, so gdb reads code from the inferior
+  sh[1].sh_name = name_text;
+  sh[1].sh_type = SHT_NOBITS;
+  sh[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+  sh[1].sh_addr = (Elf64_Addr)text_base;
+  sh[1].sh_offset = 0;
+  sh[1].sh_size = text_size;
+  sh[1].sh_addralign = 16;
+  // [2] .symtab
+  sh[2].sh_name = name_symtab;
+  sh[2].sh_type = SHT_SYMTAB;
+  sh[2].sh_offset = off_symtab;
+  sh[2].sh_size = symtab_size;
+  sh[2].sh_link = 3;    // associated string table is section [3]
+  sh[2].sh_info = 1;    // index of first non-local symbol (the null is local)
+  sh[2].sh_addralign = 8;
+  sh[2].sh_entsize = sizeof(Elf64_Sym);
+  // [3] .strtab
+  sh[3].sh_name = name_strtab;
+  sh[3].sh_type = SHT_STRTAB;
+  sh[3].sh_offset = off_strtab;
+  sh[3].sh_size = strtab_size;
+  sh[3].sh_addralign = 1;
+  // [4] .shstrtab
+  sh[4].sh_name = name_shstrtab;
+  sh[4].sh_type = SHT_STRTAB;
+  sh[4].sh_offset = off_shstrtab;
+  sh[4].sh_size = shstrtab_size;
+  sh[4].sh_addralign = 1;
+
+  *buf = p;
+  *size = total;
+  return 0;
 }

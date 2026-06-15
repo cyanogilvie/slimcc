@@ -52,6 +52,34 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 // your own import resolver instead.
 void slimcc_register_helpers(MIR_context_t ctx);
 
+// --- JIT debug symbols (GDB JIT interface) -------------------------------
+//
+// MIR emits no DWARF, so JIT'd frames are anonymous to gdb/perf. To restore
+// function-granularity symbolization (named frames in backtraces, `break
+// funcname`, labeled disassembly) build a minimal in-memory ELF object that
+// holds only a symbol table over the generated functions and hand it to a
+// debugger through the GDB JIT interface (the __jit_debug_register_code
+// protocol). Addresses and sizes come from MIR after code generation:
+// item->u.func->machine_code and ->code_len.
+typedef struct slimcc_jitsym {
+  const char *name; // symbol name (referenced, not copied; outlive the call)
+  const void *addr; // runtime address of the function/object
+  size_t size;      // byte length (0 if unknown)
+  int is_func;      // non-zero: STT_FUNC; zero: STT_OBJECT
+} slimcc_jitsym;
+
+// Build a minimal ELF object (ET_REL, host machine) holding a .symtab over the
+// given symbols, anchored to one allocatable .text section spanning their
+// address range — what gdb's JIT reader needs to map a PC to a JIT'd function
+// name. Group symbols with nearby addresses per call (e.g. one object per JIT
+// context's code region); a wide address span makes a correspondingly large
+// section. On success returns 0 and sets *buf (malloc'd; free with free()) and
+// *size. On failure returns -1 and, if errmsg is non-NULL, sets it to a
+// malloc'd message. Pure ELF construction: touches no compiler or MIR state,
+// so it needs no serialization.
+int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
+                     size_t *size, char **errmsg);
+
 // --- Precompiled preamble (header cache) ---------------------------------
 //
 // Compiling a cdef re-tokenizes the full header closure pulled in by the
