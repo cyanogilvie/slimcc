@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/cyanogilvie/mir.git
-revision = meson
+revision = debug-support
 depth = 1
 
 [provide]
