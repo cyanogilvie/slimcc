@@ -697,6 +697,10 @@ static void push_var_name2(const char *key, int keylen, Token *tok, Obj *var) {
   VarScope *vsc = push_var_scope(key, keylen, var);
   if (vsc)
     error_tok(tok, "redeclaration of '%.*s'", keylen, key);
+  // For debug info, retain the name on the local Obj: the scope's name map is
+  // freed during parsing, so the backend can't recover it otherwise.
+  if (opt_g && var != NULL && var->is_local && var->name == NULL)
+    var->name = arena_format(&ast_arena, "%.*s", keylen, key);
 }
 
 static void push_var_name(Token *name, Obj *var) {

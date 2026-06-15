@@ -456,6 +456,14 @@ int add_display_file(const char *path);
 // per-compile resets so a whole multi-block cdef shares one table; cleared by
 // slimcc_debug_reset(). Implemented in libslimcc.c.
 int slimcc_debug_intern_file(const char *name);
+// DWARF base encodings the backend can describe (see slimcc_debug_add_local).
+enum { SLIMCC_DBG_SIGNED = 1, SLIMCC_DBG_UNSIGNED, SLIMCC_DBG_FLOAT, SLIMCC_DBG_BOOL, SLIMCC_DBG_PTR };
+// Record a function-local (or parameter) for debug info: enc is one of the
+// SLIMCC_DBG_* encodings, size its byte size, mir_reg the MIR register holding
+// the variable's stack address (its frame slot is queried after gen). Stashed
+// per-function until slimcc_debug_reset; implemented in libslimcc.c.
+void slimcc_debug_add_local(const char *func, const char *name, int enc, int size,
+                            int is_param, unsigned mir_reg);
 void tokenize_string_literal(Token *tok, Type *basety);
 Token *tokenize(File *file, SlashDelta *delta, Token **end);
 void convert_pp_number(Token *tok, Node *node);
