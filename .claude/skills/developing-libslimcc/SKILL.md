@@ -93,7 +93,9 @@ Depends on fork additions to MIR (all on `meson`): `MIR_func.code_len` (symbol s
 - Local **names aren't on the `Obj`** (the scope name-map is freed during parse) — `push_var_name2` retains the name on the Obj in `opt_g` mode.
 - Per-function: reset `MIR_set_source_loc(ctx,0,0)` at each function's gen start (and before simplify's arg-ext insns) or one function's lines bleed into another's via stale `ctx->curr_source`.
 
-Validate with `readelf --debug-dump=info,decodedline` on the emitted object and a real gdb session (`break`, `next`, `info scope FUNC`, `print`). Known imperfection: statement-boundary line attribution is occasionally off by one insn. Composite types get no DIE; pointers are `void*`.
+**Type coverage** is a full interned graph: base types, typed pointers, struct/union (member DIEs at byte/bit offsets), arrays, enums (enumerator names — enum *variables* keep the list even though slimcc resolves them to the underlying int kind), and function-pointer subroutine types. `slimcc_debug_add_local` takes the `Type*` and interns it *immediately* (the arena recycles per compile) into a persistent self-contained graph (`dbg_types`/`dbg_members`); the emitter walks that, never slimcc internals. Recursive/forward type refs (`struct node { struct node *next; }`) are handled by laying out all type DIEs first then backpatching ref4 fields. `print s`/`print *p`/`p->field`/`print arr` all work.
+
+Validate with `readelf --debug-dump=info,decodedline` on the emitted object and a real gdb session (`break`, `next`, `info scope FUNC`, `print`, `ptype struct X`). Known imperfection: statement-boundary line attribution is occasionally off by one insn (a value's store can land on the next line).
 
 ## Status & next steps
 
