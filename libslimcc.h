@@ -32,6 +32,7 @@ typedef struct slimcc_options {
   const slimcc_vfile *vfiles; // in-memory #include targets
   int n_vfiles;
   FILE *mir_dump; // if set, the textual MIR module is dumped here
+  const struct slimcc_pch *pch; // if set, a precompiled preamble (see below)
 } slimcc_options;
 
 // Compile one translation unit from memory. On success returns a finished,
@@ -50,6 +51,42 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 // Call once per context before MIR_link, or provide the symbols through
 // your own import resolver instead.
 void slimcc_register_helpers(MIR_context_t ctx);
+
+// --- Precompiled preamble (header cache) ---------------------------------
+//
+// Compiling a cdef re-tokenizes the full header closure pulled in by the
+// preamble (for jitc, tcl.h via tclstuff.h: ~12k lines across ~37 files)
+// every time, which dominates the small-input compile latency. A slimcc_pch
+// captures the preprocessed state of a fixed preamble once so subsequent
+// compiles sharing it skip the re-tokenize.
+//
+// `preamble` is the text that conceptually precedes the cdef body, e.g.
+// "#include <tclstuff.h>\n". Build a pch once with the same options
+// (include paths, defines, vfiles) you pass to slimcc_compile, then set
+// opt->pch and pass the cdef body alone as `source`.
+//
+// A pch records every real file its preamble preprocess opened, with mtime
+// and size. slimcc_compile revalidates it (cache key + re-stat of those
+// files) on each use: a stale or mismatched pch is silently ignored and the
+// compile falls back to processing the preamble inline, so a pch is never a
+// correctness hazard — at worst it costs the stat() calls.
+//
+// On failure returns NULL and, if errmsg is non-NULL, sets it to a malloc'd
+// diagnostic the caller must free. Free with slimcc_pch_free. Serialize pch
+// creation/use/free with slimcc_compile like all other library state.
+typedef struct slimcc_pch slimcc_pch;
+
+slimcc_pch *slimcc_pch_create(const char *preamble, const slimcc_options *opt,
+                              char **errmsg);
+void slimcc_pch_free(slimcc_pch *pch);
+
+// Re-stat every file the pch read while building; returns false if any is
+// missing or its mtime/size changed since. slimcc_compile calls this itself;
+// it is exposed for callers that want to proactively rebuild a stale pch.
+bool slimcc_pch_valid(const slimcc_pch *pch);
+
+// Number of input files the pch captured (diagnostics / tests).
+int slimcc_pch_nfiles(const slimcc_pch *pch);
 
 // Release libslimcc's process-global state (the cross-compilation arena pool
 // freelist). Optional: call once when unloading the library from a host that
