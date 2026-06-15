@@ -800,6 +800,18 @@ static void dwarf_line(Buf *b, const slimcc_jitsym *syms, int nsyms) {
     buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr);
     uint32_t cur_off = 0, cur_line = 1, cur_file = 1;
     int prologue_marked = 0;
+    // The generated prologue is left unattributed, so the first real entry is
+    // at offset > 0. Emit a row at the entry point (low_pc) carrying that first
+    // line, so a debugger has a line for the function's address and `break
+    // func` resolves; the matching entry below then carries prologue_end.
+    {
+      const MIR_line_map_t *e0 = &syms[i].line_map[0];
+      uint32_t f0 = e0->file_id ? e0->file_id : 1;
+      if (f0 != cur_file) { buf_u8(b, DW_LNS_set_file); buf_uleb(b, f0); cur_file = f0; }
+      buf_u8(b, DW_LNS_advance_line); buf_sleb(b, (int64_t)e0->line - (int64_t)cur_line);
+      cur_line = e0->line;
+      buf_u8(b, DW_LNS_copy); // row at offset 0
+    }
     for (size_t j = 0; j < syms[i].line_map_len; j++) {
       const MIR_line_map_t *e = &syms[i].line_map[j];
       uint32_t file = e->file_id ? e->file_id : 1;
