@@ -1,6 +1,6 @@
 ---
 name: developing-libslimcc
-description: Architecture, build/test commands, suite baselines, and hard-won invariants for the slimcc MIR JIT backend (libslimcc, branch mir-backend). Use when working on codegen-mir.c, libslimcc, platform/mir.c, the meson build, the embedded headers, or when running/diagnosing the JIT test suite.
+description: Architecture, build/test commands, suite baselines, and hard-won invariants for the slimcc MIR JIT backend (libslimcc, branch mir-backend). Use when working on codegen-mir.c, libslimcc, platform/mir.c, the precompiled-preamble (pch) header cache, the meson build, the embedded headers, or when running/diagnosing the JIT test suite.
 ---
 
 # Developing libslimcc (slimcc → MIR JIT backend)
@@ -20,7 +20,8 @@ The parser→backend boundary is exactly 7 symbols declared in slimcc.h (~line 1
 | File | Role |
 |---|---|
 | `codegen-mir.c` / `codegen-mir.h` | The backend: AST → MIR via the direct C API |
-| `libslimcc.c` / `libslimcc.h` | Public API: `slimcc_compile()` + `slimcc_register_helpers()`; error longjmp, global resets, vfile registry, embedded headers |
+| `libslimcc.c` / `libslimcc.h` | Public API: `slimcc_compile()` + `slimcc_register_helpers()` + `slimcc_pch_*` (header cache); error longjmp, global resets, vfile registry, embedded headers, dep/mtime recorder |
+| `preprocess.c` (additive only) | `pp_snapshot`/`pp_install`/`pp_free_state` — the pch snapshot engine (lives here because `Macro` is private to this TU) |
 | `slimcc-mir-helpers.c` | Host-compiled runtime helpers registered via `MIR_load_external` |
 | `platform/mir.c` | Host-arch predefined macros, type policies (unsigned plain char + unsigned wchar_t on aarch64), stub assembler/linker hooks |
 | `mir-run.c` → `slimcc-mir-run` | Test driver: compile + link + run a .c file under the JIT |
@@ -61,6 +62,23 @@ A regression is a *change* against these lists, not membership in them.
 ## Patch-set discipline
 
 Keep diffs out of `codegen.c`/`parse.c`/`main.c`/`type.c`. Embedding hooks in `tokenize.c`/`preprocess.c`/`parse.c` resets are small and append-biased (~200 changed lines total in churning files). Every backend switch over node kinds ends in `default: error_tok(...)` so upstream AST additions fail loudly. After any change, `make test` (stock binary) must stay green — it proves the patch set doesn't disturb the normal compiler.
+
+## Precompiled preamble (pch) header cache
+
+`slimcc_pch_create(preamble, opt)` snapshots the preprocessor state reached after a fixed preamble so repeated compiles skip re-tokenizing the header closure (for jitc: tcl.h via tclstuff.h, ~12k lines / ~37 files — ~4.7× faster on a header-heavy body, drops jitc's tiny-cdef floor ~4.8ms→~2.0ms). `slimcc_compile` with `opt->pch` set installs the snapshot, tokenizes only the body, splices `preamble_tokens ++ body`. The snapshot lives in a pch-owned `Arena` (never `arena_off`'d until `slimcc_pch_free`). Engine in `preprocess.c` (`pp_snapshot`/`pp_install`); cache key + dep/mtime recorder in `libslimcc.c`.
+
+A pch is **purely an optimization, never a correctness dependency**: it records every real file opened (path+mtime+size via the `add_dep_file` hook), and `slimcc_compile` revalidates (option-key + re-stat) on each use, silently falling back to compiling `preamble + "\n" + body` inline when stale/mismatched. jitc caches one pch per `(preamble, defines, includes)` and rebuilds on staleness.
+
+Invariants the snapshot must preserve (each cost a test-suite failure to find — don't re-break them):
+
+- **Checkpoint is post-`preprocess()`, pre-`prepare_parse()`.** Main-stream tokens are still PP-form there (`TK_PP_NUM`, idents not yet keywords, `ty==NULL`), so the token graph needs no `Type` copy — *except* see the string-literal point below. `prepare_parse`→`preprocess3` (keyword conversion, `join_adjacent_string_literals`) must run per-compile on the spliced stream, so it can't be pre-baked.
+- **Instantiate via `copy_token`, mark `is_root`.** Per-compile preamble tokens must be ordinary `tok_alloc`'d tokens (not `arena_malloc`'d) so every freeing path handles them: `parse`'s `free_parsed_tok`, `preprocess3`'s attribute/pragma `to_freelist`, and `prepare_parse`'s pre-`preprocess3` sweep (which keeps `is_root` tokens). An arena token reaching `tok_free` is a bad-free.
+- **Macro bodies/params keep their terminating `TK_EOF`; the main chain drops it.** `subst` iterates a macro body `while (kind != TK_EOF)`; a dropped EOF walks off the end (SIGSEGV). The spliced main chain instead drops EOF so the body's EOF terminates the TU.
+- **String-literal tokens in macro bodies carry dangling `ty`/`str`.** Macro bodies are tokenized at `#define` time, so their `TK_STR` tokens already have `ty = array_of(...)` and `str = <decoded bytes>` pointing into per-compile storage freed after `pch_create`. The snapshot must deep-copy both into the pch arena (shallow `Type` copy — base is a global element type). Numbers are still PP_NUM (re-decoded from `loc`); char constants' `ty` is a global singleton.
+- **Per-compile `Macro` copies, shared read-only bodies.** `pp_install` copies each `Macro` struct into `pp_arena` (resetting `is_locked`/`locked_next`/`stop_tok`) but shares `body`/`params` from the pch arena — expansion reads them, never mutates. The macro/guard tables are rebuilt per-compile (the body `#define`s/`#include`s into them).
+- **The fast path skips `init_macros`/`platform_init_cc1`/`lib_macros`** (all baked into the pch via the matching-key guarantee) but must NOT skip the non-macro target setup — except `init_ty_lp64()`'s type globals (`ty_size_t`, `enum_ty`, …) are process-persistent (`type_reset` only clears `void_ptr_cache`) and set when the pch was built, so re-running it would just re-`#define` its macros and churn/leak the table. So: call nothing.
+
+Validation harness pattern: an *oracle* (same program compiled inline vs via pch must produce identical run output), ASAN for the freeing invariants, and an RSS-over-N-compiles loop for leaks (production build = `tok_pooled()`, bulk-freed; ASAN build = `EAGER_FREE`, individual free — both must be clean). The function-like-variadic and multi-line-`-D` cases only surface through the real jitc suite (`capply-6.5`), so run it.
 
 ## Status & next steps
 
