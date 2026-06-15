@@ -451,6 +451,11 @@ bool consume_tk(Token **rest, Token *tok, TokenKind kind);
 Token *tokenize_file(const char *path, Token *tok, Token **end);
 File *new_file(const char *name, const char *contents);
 int add_display_file(const char *path);
+// Intern a source file path into the persistent debug-info file table, returning
+// a 1-based id (0 = none) carried on MIR insns via MIR_set_source_loc. Survives
+// per-compile resets so a whole multi-block cdef shares one table; cleared by
+// slimcc_debug_reset(). Implemented in libslimcc.c.
+int slimcc_debug_intern_file(const char *name);
 void tokenize_string_literal(Token *tok, Type *basety);
 Token *tokenize(File *file, SlashDelta *delta, Token **end);
 void convert_pp_number(Token *tok, Node *node);

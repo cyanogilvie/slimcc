@@ -352,6 +352,7 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 
   slimcc_vfile_add(name, source);
   register_embedded_headers();
+  opt_g = opt && opt->debug; // gate source-location stamping in codegen-mir
   if (opt) {
     for (int i = 0; i < opt->n_vfiles; i++)
       slimcc_vfile_add(opt->vfiles[i].name, opt->vfiles[i].contents);
@@ -577,6 +578,7 @@ void slimcc_shutdown(void) {
   // compiling again afterwards simply rebuilds everything on demand.
   reset_all();
   arena_free_pools();
+  slimcc_debug_reset();
 }
 
 // --- JIT debug symbols (GDB JIT interface) -------------------------------
@@ -603,6 +605,235 @@ static int debug_obj_fail(char **errmsg, const char *msg) {
   return -1;
 }
 
+// Persistent debug source-file table: file id (1-based) -> path. Accumulates
+// across the compiles of one debug build and survives reset_all (unlike
+// display_files, which is per-compile), so all of a cdef's code blocks share
+// one id space — the ids the codegen stamped onto MIR insns stay meaningful
+// when slimcc_debug_obj runs after every block has compiled. Cleared by
+// slimcc_debug_reset().
+static struct {
+  char **names;
+  int len, cap;
+} dbg_files;
+
+int slimcc_debug_intern_file(const char *name) {
+  if (!name) return 0;
+  for (int i = 0; i < dbg_files.len; i++)
+    if (strcmp(dbg_files.names[i], name) == 0) return i + 1;
+  if (dbg_files.len == dbg_files.cap) {
+    dbg_files.cap = dbg_files.cap ? dbg_files.cap * 2 : 8;
+    dbg_files.names = realloc(dbg_files.names, dbg_files.cap * sizeof(char *));
+  }
+  dbg_files.names[dbg_files.len++] = strdup(name);
+  return dbg_files.len;
+}
+
+void slimcc_debug_reset(void) {
+  for (int i = 0; i < dbg_files.len; i++) free(dbg_files.names[i]);
+  free(dbg_files.names);
+  dbg_files.names = NULL;
+  dbg_files.len = dbg_files.cap = 0;
+}
+
+// ---- small growable byte buffer for assembling ELF/DWARF section bodies ----
+typedef struct {
+  unsigned char *p;
+  size_t len, cap;
+} Buf;
+
+static int buf_reserve(Buf *b, size_t n) {
+  if (b->len + n <= b->cap) return 0;
+  size_t c = b->cap ? b->cap * 2 : 128;
+  while (c < b->len + n) c *= 2;
+  void *np = realloc(b->p, c);
+  if (!np) return -1;
+  b->p = np;
+  b->cap = c;
+  return 0;
+}
+static void buf_bytes(Buf *b, const void *d, size_t n) {
+  if (buf_reserve(b, n)) return;
+  memcpy(b->p + b->len, d, n);
+  b->len += n;
+}
+static void buf_u8(Buf *b, uint8_t v) { buf_bytes(b, &v, 1); }
+static void buf_u16(Buf *b, uint16_t v) { buf_bytes(b, &v, 2); }
+static void buf_u32(Buf *b, uint32_t v) { buf_bytes(b, &v, 4); }
+static void buf_u64(Buf *b, uint64_t v) { buf_bytes(b, &v, 8); }
+static void buf_str(Buf *b, const char *s) { buf_bytes(b, s, strlen(s) + 1); }
+static void buf_uleb(Buf *b, uint64_t v) {
+  do {
+    uint8_t x = v & 0x7f;
+    v >>= 7;
+    if (v) x |= 0x80;
+    buf_u8(b, x);
+  } while (v);
+}
+static void buf_sleb(Buf *b, int64_t v) {
+  for (;;) {
+    uint8_t x = v & 0x7f;
+    v >>= 7; // arithmetic shift
+    int done = (v == 0 && !(x & 0x40)) || (v == -1 && (x & 0x40));
+    if (!done) x |= 0x80;
+    buf_u8(b, x);
+    if (done) break;
+  }
+}
+
+// DWARF constants (just what we emit).
+enum {
+  DW_TAG_compile_unit = 0x11,
+  DW_TAG_subprogram = 0x2e,
+  DW_CHILDREN_no = 0,
+  DW_CHILDREN_yes = 1,
+  DW_AT_name = 0x03,
+  DW_AT_stmt_list = 0x10,
+  DW_AT_low_pc = 0x11,
+  DW_AT_high_pc = 0x12,
+  DW_AT_language = 0x13,
+  DW_AT_comp_dir = 0x1b,
+  DW_AT_producer = 0x25,
+  DW_AT_external = 0x3f,
+  DW_FORM_addr = 0x01,
+  DW_FORM_data2 = 0x05,
+  DW_FORM_string = 0x08,
+  DW_FORM_flag = 0x0c,
+  DW_FORM_sec_offset = 0x17,
+  DW_LANG_C99 = 0x0c,
+  DW_LNS_copy = 1,
+  DW_LNS_advance_pc = 2,
+  DW_LNS_advance_line = 3,
+  DW_LNS_set_file = 4,
+  DW_LNS_set_prologue_end = 10,
+  DW_LNE_end_sequence = 1,
+  DW_LNE_set_address = 2,
+};
+
+// .debug_abbrev: abbrev 1 = compile_unit (has children), 2 = subprogram (leaf).
+static void dwarf_abbrev(Buf *b) {
+  buf_uleb(b, 1);
+  buf_uleb(b, DW_TAG_compile_unit);
+  buf_u8(b, DW_CHILDREN_yes);
+  buf_uleb(b, DW_AT_producer);  buf_uleb(b, DW_FORM_string);
+  buf_uleb(b, DW_AT_language);  buf_uleb(b, DW_FORM_data2);
+  buf_uleb(b, DW_AT_name);      buf_uleb(b, DW_FORM_string);
+  buf_uleb(b, DW_AT_comp_dir);  buf_uleb(b, DW_FORM_string);
+  buf_uleb(b, DW_AT_low_pc);    buf_uleb(b, DW_FORM_addr);
+  buf_uleb(b, DW_AT_high_pc);   buf_uleb(b, DW_FORM_addr);
+  buf_uleb(b, DW_AT_stmt_list); buf_uleb(b, DW_FORM_sec_offset);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+  buf_uleb(b, 2);
+  buf_uleb(b, DW_TAG_subprogram);
+  buf_u8(b, DW_CHILDREN_no);
+  buf_uleb(b, DW_AT_name);     buf_uleb(b, DW_FORM_string);
+  buf_uleb(b, DW_AT_low_pc);   buf_uleb(b, DW_FORM_addr);
+  buf_uleb(b, DW_AT_high_pc);  buf_uleb(b, DW_FORM_addr);
+  buf_uleb(b, DW_AT_external); buf_uleb(b, DW_FORM_flag);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+  buf_uleb(b, 0); // end of table
+}
+
+// .debug_info: one CU with a subprogram DIE per function symbol.
+static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
+                       uint64_t text_base, uint64_t text_size, const char *cu_name) {
+  size_t unit_len_pos = b->len;
+  buf_u32(b, 0); // unit_length, patched below
+  size_t after_len = b->len;
+  buf_u16(b, 4);  // DWARF version
+  buf_u32(b, 0);  // .debug_abbrev offset
+  buf_u8(b, 8);   // address size
+  buf_uleb(b, 1); // CU abbrev code
+  buf_str(b, "slimcc");
+  buf_u16(b, DW_LANG_C99);
+  buf_str(b, cu_name ? cu_name : "cdef");
+  buf_str(b, "");
+  buf_u64(b, text_base);
+  buf_u64(b, text_base + text_size);
+  buf_u32(b, 0); // stmt_list -> .debug_line offset 0
+  for (int i = 0; i < nsyms; i++) {
+    if (!syms[i].is_func || !syms[i].addr) continue;
+    buf_uleb(b, 2); // subprogram abbrev
+    buf_str(b, syms[i].name ? syms[i].name : "");
+    buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr);
+    buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr + syms[i].size);
+    buf_u8(b, 1); // external
+  }
+  buf_u8(b, 0); // end of CU children
+  uint32_t unit_len = (uint32_t)(b->len - after_len);
+  memcpy(b->p + unit_len_pos, &unit_len, 4);
+}
+
+// .debug_line: a DWARF4 line program with one sequence per function. file ids
+// in the line maps are 1-based indices into the debug file table (dbg_files).
+static void dwarf_line(Buf *b, const slimcc_jitsym *syms, int nsyms) {
+  size_t unit_len_pos = b->len;
+  buf_u32(b, 0); // unit_length, patched
+  size_t after_len = b->len;
+  buf_u16(b, 4); // version
+  size_t hdr_len_pos = b->len;
+  buf_u32(b, 0); // header_length, patched
+  size_t after_hdr_len = b->len;
+  buf_u8(b, 1);  // minimum_instruction_length
+  buf_u8(b, 1);  // maximum_operations_per_instruction
+  buf_u8(b, 1);  // default_is_stmt
+  buf_u8(b, (uint8_t)(int8_t)-5); // line_base
+  buf_u8(b, 14); // line_range
+  buf_u8(b, 13); // opcode_base
+  static const uint8_t std_lens[12] = {0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1};
+  buf_bytes(b, std_lens, sizeof std_lens);
+  buf_u8(b, 0); // include_directories: empty list terminator
+  for (int i = 0; i < dbg_files.len; i++) { // file_names (1-based)
+    buf_str(b, dbg_files.names[i]);
+    buf_uleb(b, 0); // dir index
+    buf_uleb(b, 0); // mtime
+    buf_uleb(b, 0); // size
+  }
+  buf_u8(b, 0); // file_names terminator
+  uint32_t hdr_len = (uint32_t)(b->len - after_hdr_len);
+  memcpy(b->p + hdr_len_pos, &hdr_len, 4);
+
+  for (int i = 0; i < nsyms; i++) {
+    if (!syms[i].is_func || !syms[i].addr || !syms[i].line_map || syms[i].line_map_len == 0)
+      continue;
+    // set_address to the function's runtime address
+    buf_u8(b, 0); buf_uleb(b, 9); buf_u8(b, DW_LNE_set_address);
+    buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr);
+    uint32_t cur_off = 0, cur_line = 1, cur_file = 1;
+    int prologue_marked = 0;
+    for (size_t j = 0; j < syms[i].line_map_len; j++) {
+      const MIR_line_map_t *e = &syms[i].line_map[j];
+      uint32_t file = e->file_id ? e->file_id : 1;
+      if (file != cur_file) { buf_u8(b, DW_LNS_set_file); buf_uleb(b, file); cur_file = file; }
+      if (e->line != cur_line) {
+        buf_u8(b, DW_LNS_advance_line);
+        buf_sleb(b, (int64_t)e->line - (int64_t)cur_line);
+        cur_line = e->line;
+      }
+      if (e->code_offset != cur_off) {
+        buf_u8(b, DW_LNS_advance_pc);
+        buf_uleb(b, (uint64_t)(e->code_offset - cur_off));
+        cur_off = e->code_offset;
+      }
+      // Mark the first row past the entry point as prologue end, so gdb's
+      // `break func` lands on the first real statement rather than the
+      // (imperfectly attributed) entry row.
+      if (!prologue_marked && e->code_offset != 0) {
+        buf_u8(b, DW_LNS_set_prologue_end);
+        prologue_marked = 1;
+      }
+      buf_u8(b, DW_LNS_copy);
+    }
+    // advance to function end and close the sequence
+    if (syms[i].size > cur_off) {
+      buf_u8(b, DW_LNS_advance_pc);
+      buf_uleb(b, (uint64_t)(syms[i].size - cur_off));
+    }
+    buf_u8(b, 0); buf_uleb(b, 1); buf_u8(b, DW_LNE_end_sequence);
+  }
+  uint32_t unit_len = (uint32_t)(b->len - after_len);
+  memcpy(b->p + unit_len_pos, &unit_len, 4);
+}
+
 int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
                      size_t *size, char **errmsg) {
   if (errmsg) *errmsg = NULL;
@@ -619,52 +850,108 @@ int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
   // section spanning their address range, and define each symbol relative to
   // it (st_shndx = .text, st_value = addr - text_base). gdb places the section
   // at sh_addr and reads the actual instruction bytes from inferior memory.
-  // Callers should therefore group symbols with nearby addresses (jitc emits
-  // one object per cdef context, whose code MIR keeps in one region).
   uintptr_t lo = UINTPTR_MAX, hi = 0;
+  int have_lines = 0;
   for (int i = 0; i < nsyms; i++) {
     if (!syms[i].addr) continue;
     uintptr_t a = (uintptr_t)syms[i].addr;
     uintptr_t e = a + (syms[i].size ? syms[i].size : 1);
     if (a < lo) lo = a;
     if (e > hi) hi = e;
+    if (syms[i].is_func && syms[i].line_map && syms[i].line_map_len) have_lines = 1;
   }
-  if (lo == UINTPTR_MAX) lo = hi = 0; // no addressed symbols
-  uintptr_t text_base = lo;
-  uint64_t text_size = hi > lo ? (uint64_t)(hi - lo) : 0;
+  if (lo == UINTPTR_MAX) lo = hi = 0;
+  uint64_t text_base = lo, text_size = hi > lo ? (uint64_t)(hi - lo) : 0;
 
-  // The symbol table carries a leading null symbol (index 0), then one symbol
-  // per input. Section layout: [0] null, [1] .text, [2] .symtab, [3] .strtab,
-  // [4] .shstrtab.
-  size_t nsym = (size_t)nsyms + 1;
+  // Build the section bodies. DWARF debug sections only when line maps exist.
+  Buf strtab = {0}, symtab = {0}, abbrev = {0}, info = {0}, line = {0};
+  buf_u8(&strtab, 0); // leading NUL
+  // null symbol
+  Elf64_Sym z = {0};
+  buf_bytes(&symtab, &z, sizeof z);
+  for (int i = 0; i < nsyms; i++) {
+    const char *nm = syms[i].name ? syms[i].name : "";
+    Elf64_Sym s = {0};
+    s.st_name = (Elf64_Word)strtab.len;
+    buf_str(&strtab, nm);
+    s.st_info = ELF64_ST_INFO(STB_GLOBAL, syms[i].is_func ? STT_FUNC : STT_OBJECT);
+    s.st_other = STV_DEFAULT;
+    if (syms[i].addr) {
+      s.st_shndx = 1; // .text
+      s.st_value = (Elf64_Addr)((uintptr_t)syms[i].addr - text_base);
+    } else {
+      s.st_shndx = SHN_UNDEF;
+    }
+    s.st_size = (Elf64_Xword)syms[i].size;
+    buf_bytes(&symtab, &s, sizeof s);
+  }
+  const char *cu_name = dbg_files.len ? dbg_files.names[0] : "cdef";
+  if (have_lines) {
+    dwarf_abbrev(&abbrev);
+    dwarf_info(&info, syms, nsyms, text_base, text_size, cu_name);
+    dwarf_line(&line, syms, nsyms);
+  }
 
-  // .strtab: a leading NUL, then each name NUL-terminated. Record each
-  // symbol's name offset as we go.
-  size_t strtab_size = 1;
-  for (int i = 0; i < nsyms; i++)
-    strtab_size += strlen(syms[i].name ? syms[i].name : "") + 1;
+  // Section table. Indices must match the symtab's st_shndx (.text = 1) and the
+  // symtab's sh_link (.strtab). Order: null, .text, .symtab, .strtab, [debug], .shstrtab.
+  struct {
+    const char *name;
+    uint32_t type, link, info, align;
+    uint64_t flags, addr, entsize;
+    const Buf *body; // NULL => NOBITS sized by `size`
+    uint64_t size;
+  } S[16];
+  int ns = 0;
+  S[ns++] = (typeof(S[0])){0};
+  int i_text = ns;
+  S[ns++] = (typeof(S[0])){".text", SHT_NOBITS, 0, 0, 16, SHF_ALLOC | SHF_EXECINSTR,
+                           text_base, 0, NULL, text_size};
+  int i_strtab_pending = -1; // fixed after we know .strtab index
+  int i_symtab = ns;
+  S[ns++] = (typeof(S[0])){".symtab", SHT_SYMTAB, 0 /*link set below*/, 1, 8, 0, 0,
+                           sizeof(Elf64_Sym), &symtab, symtab.len};
+  int i_strtab = ns;
+  S[ns++] = (typeof(S[0])){".strtab", SHT_STRTAB, 0, 0, 1, 0, 0, 0, &strtab, strtab.len};
+  S[i_symtab].link = (uint32_t)i_strtab;
+  (void)i_strtab_pending;
+  if (have_lines) {
+    S[ns++] = (typeof(S[0])){".debug_abbrev", SHT_PROGBITS, 0, 0, 1, 0, 0, 0, &abbrev, abbrev.len};
+    S[ns++] = (typeof(S[0])){".debug_info", SHT_PROGBITS, 0, 0, 1, 0, 0, 0, &info, info.len};
+    S[ns++] = (typeof(S[0])){".debug_line", SHT_PROGBITS, 0, 0, 1, 0, 0, 0, &line, line.len};
+  }
+  int i_shstr = ns;
+  // .shstrtab body built from the section names.
+  Buf shstr = {0};
+  buf_u8(&shstr, 0);
+  uint32_t name_off[16];
+  name_off[0] = 0;
+  for (int i = 1; i < ns; i++) { name_off[i] = (uint32_t)shstr.len; buf_str(&shstr, S[i].name); }
+  uint32_t name_shstr = (uint32_t)shstr.len;
+  buf_str(&shstr, ".shstrtab");
+  S[ns++] = (typeof(S[0])){".shstrtab", SHT_STRTAB, 0, 0, 1, 0, 0, 0, &shstr, shstr.len};
+  name_off[i_shstr] = name_shstr;
+  (void)i_text;
 
-  static const char shstr[] = "\0.text\0.symtab\0.strtab\0.shstrtab";
-  size_t shstrtab_size = sizeof(shstr); // includes the trailing NUL
-  // Offsets of each section name within shstr (counted from its leading NUL).
-  const Elf64_Word name_text = 1;
-  const Elf64_Word name_symtab = 7;
-  const Elf64_Word name_strtab = 15;
-  const Elf64_Word name_shstrtab = 23;
-
-  size_t off_ehdr = 0;
-  size_t off_symtab = (sizeof(Elf64_Ehdr) + 7) & ~(size_t)7; // 8-align symtab
-  size_t symtab_size = nsym * sizeof(Elf64_Sym);
-  size_t off_strtab = off_symtab + symtab_size;
-  size_t off_shstrtab = off_strtab + strtab_size;
-  size_t off_shdr = (off_shstrtab + shstrtab_size + 7) & ~(size_t)7;
-  size_t total = off_shdr + 5 * sizeof(Elf64_Shdr);
+  // Lay out: ehdr, then each section body (8-aligned), then section headers.
+  size_t off = sizeof(Elf64_Ehdr);
+  uint64_t sec_off[16] = {0};
+  for (int i = 1; i < ns; i++) {
+    if (S[i].type == SHT_NOBITS) { sec_off[i] = off; continue; }
+    off = (off + 7) & ~(size_t)7;
+    sec_off[i] = off;
+    off += S[i].size;
+  }
+  off = (off + 7) & ~(size_t)7;
+  size_t shoff = off;
+  size_t total = shoff + (size_t)ns * sizeof(Elf64_Shdr);
 
   unsigned char *p = calloc(1, total);
-  if (!p) return debug_obj_fail(errmsg, "slimcc_debug_obj: out of memory");
+  if (!p) {
+    free(strtab.p); free(symtab.p); free(abbrev.p); free(info.p); free(line.p); free(shstr.p);
+    return debug_obj_fail(errmsg, "slimcc_debug_obj: out of memory");
+  }
 
-  // ELF header.
-  Elf64_Ehdr *eh = (Elf64_Ehdr *)(p + off_ehdr);
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)p;
   eh->e_ident[EI_MAG0] = ELFMAG0;
   eh->e_ident[EI_MAG1] = ELFMAG1;
   eh->e_ident[EI_MAG2] = ELFMAG2;
@@ -676,70 +963,29 @@ int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
   eh->e_type = ET_REL;
   eh->e_machine = SLIMCC_ELF_MACHINE;
   eh->e_version = EV_CURRENT;
-  eh->e_shoff = off_shdr;
+  eh->e_shoff = shoff;
   eh->e_ehsize = sizeof(Elf64_Ehdr);
   eh->e_shentsize = sizeof(Elf64_Shdr);
-  eh->e_shnum = 5;
-  eh->e_shstrndx = 4;
+  eh->e_shnum = (Elf64_Half)ns;
+  eh->e_shstrndx = (Elf64_Half)i_shstr;
 
-  // Symbol table + string table (index 0 of each is the reserved null entry).
-  Elf64_Sym *st = (Elf64_Sym *)(p + off_symtab);
-  char *strtab = (char *)(p + off_strtab);
-  size_t stroff = 1; // [0] is the leading NUL
-  for (int i = 0; i < nsyms; i++) {
-    const char *nm = syms[i].name ? syms[i].name : "";
-    size_t len = strlen(nm) + 1;
-    memcpy(strtab + stroff, nm, len);
-    Elf64_Sym *s = &st[i + 1];
-    s->st_name = (Elf64_Word)stroff;
-    s->st_info = ELF64_ST_INFO(STB_GLOBAL, syms[i].is_func ? STT_FUNC : STT_OBJECT);
-    s->st_other = STV_DEFAULT;
-    if (syms[i].addr) {
-      s->st_shndx = 1; // .text — relative to the anchoring section
-      s->st_value = (Elf64_Addr)((uintptr_t)syms[i].addr - text_base);
-    } else {
-      s->st_shndx = SHN_UNDEF;
-      s->st_value = 0;
-    }
-    s->st_size = (Elf64_Xword)syms[i].size;
-    stroff += len;
+  Elf64_Shdr *sh = (Elf64_Shdr *)(p + shoff);
+  for (int i = 1; i < ns; i++) {
+    if (S[i].type != SHT_NOBITS && S[i].body && S[i].size)
+      memcpy(p + sec_off[i], S[i].body->p, S[i].size);
+    sh[i].sh_name = name_off[i];
+    sh[i].sh_type = S[i].type;
+    sh[i].sh_flags = S[i].flags;
+    sh[i].sh_addr = S[i].addr;
+    sh[i].sh_offset = (S[i].type == SHT_NOBITS) ? 0 : sec_off[i];
+    sh[i].sh_size = S[i].size;
+    sh[i].sh_link = S[i].link;
+    sh[i].sh_info = S[i].info;
+    sh[i].sh_addralign = S[i].align;
+    sh[i].sh_entsize = S[i].entsize;
   }
 
-  // Section name string table.
-  memcpy(p + off_shstrtab, shstr, shstrtab_size);
-
-  // Section headers.
-  Elf64_Shdr *sh = (Elf64_Shdr *)(p + off_shdr);
-  // [1] .text — allocatable anchor; NOBITS, so gdb reads code from the inferior
-  sh[1].sh_name = name_text;
-  sh[1].sh_type = SHT_NOBITS;
-  sh[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-  sh[1].sh_addr = (Elf64_Addr)text_base;
-  sh[1].sh_offset = 0;
-  sh[1].sh_size = text_size;
-  sh[1].sh_addralign = 16;
-  // [2] .symtab
-  sh[2].sh_name = name_symtab;
-  sh[2].sh_type = SHT_SYMTAB;
-  sh[2].sh_offset = off_symtab;
-  sh[2].sh_size = symtab_size;
-  sh[2].sh_link = 3;    // associated string table is section [3]
-  sh[2].sh_info = 1;    // index of first non-local symbol (the null is local)
-  sh[2].sh_addralign = 8;
-  sh[2].sh_entsize = sizeof(Elf64_Sym);
-  // [3] .strtab
-  sh[3].sh_name = name_strtab;
-  sh[3].sh_type = SHT_STRTAB;
-  sh[3].sh_offset = off_strtab;
-  sh[3].sh_size = strtab_size;
-  sh[3].sh_addralign = 1;
-  // [4] .shstrtab
-  sh[4].sh_name = name_shstrtab;
-  sh[4].sh_type = SHT_STRTAB;
-  sh[4].sh_offset = off_shstrtab;
-  sh[4].sh_size = shstrtab_size;
-  sh[4].sh_addralign = 1;
-
+  free(strtab.p); free(symtab.p); free(abbrev.p); free(info.p); free(line.p); free(shstr.p);
   *buf = p;
   *size = total;
   return 0;

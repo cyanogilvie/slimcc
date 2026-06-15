@@ -33,6 +33,7 @@ typedef struct slimcc_options {
   int n_vfiles;
   FILE *mir_dump; // if set, the textual MIR module is dumped here
   const struct slimcc_pch *pch; // if set, a precompiled preamble (see below)
+  int debug; // if non-zero, emit source locations for debug info (see slimcc_debug_obj)
 } slimcc_options;
 
 // Compile one translation unit from memory. On success returns a finished,
@@ -66,6 +67,13 @@ typedef struct slimcc_jitsym {
   const void *addr; // runtime address of the function/object
   size_t size;      // byte length (0 if unknown)
   int is_func;      // non-zero: STT_FUNC; zero: STT_OBJECT
+  // Optional, functions only: the MIR per-function code-offset -> source-line
+  // map (MIR_func.line_map / line_map_len, valid after MIR_gen). When present,
+  // slimcc_debug_obj also emits DWARF .debug_line + a subprogram DIE so a
+  // debugger can do source-level stepping. File ids in the map index slimcc's
+  // debug file table (see slimcc_debug_intern_file).
+  const MIR_line_map_t *line_map;
+  size_t line_map_len;
 } slimcc_jitsym;
 
 // Build a minimal ELF object (ET_REL, host machine) holding a .symtab over the
@@ -79,6 +87,12 @@ typedef struct slimcc_jitsym {
 // so it needs no serialization.
 int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
                      size_t *size, char **errmsg);
+
+// Clear the persistent debug source-file table that accumulates across the
+// compiles of one debug build (see slimcc_debug_intern_file). Call after
+// building the debug object for a cdef, before starting the next, so file ids
+// don't leak between unrelated builds.
+void slimcc_debug_reset(void);
 
 // --- Precompiled preamble (header cache) ---------------------------------
 //
