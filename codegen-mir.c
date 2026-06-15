@@ -262,6 +262,42 @@ static void alloca_scope(Scope *sc) {
     alloca_scope(sub);
 }
 
+// Map a slimcc scalar type to a DWARF base encoding for debug info, or 0 if it
+// has no simple base representation (struct/array/etc — skipped for now).
+static int dbg_encoding(Type *ty) {
+  switch (ty->kind) {
+  case TY_BOOL:
+    return SLIMCC_DBG_BOOL;
+  case TY_FLOAT: case TY_DOUBLE: case TY_LDOUBLE:
+    return SLIMCC_DBG_FLOAT;
+  case TY_PCHAR: case TY_CHAR: case TY_SHORT: case TY_INT:
+  case TY_LONG: case TY_LONGLONG: case TY_ENUM:
+    return ty->is_unsigned ? SLIMCC_DBG_UNSIGNED : SLIMCC_DBG_SIGNED;
+  case TY_PTR: case TY_NULLPTR:
+    return SLIMCC_DBG_PTR;
+  default:
+    return 0;
+  }
+}
+
+// Stash one named local for debug info: base encoding + the MIR register holding
+// its stack address (whose frame slot is resolved post-gen). The name is set on
+// the Obj at declaration time in debug mode (see push_var_name2).
+static void dbg_stash_var(Obj *fn, Obj *v) {
+  if (v->name == NULL || v->ptr != mir_local_marker)
+    return;
+  int enc = dbg_encoding(v->ty);
+  if (enc)
+    slimcc_debug_add_local(sym_name(fn), v->name, enc, (int)v->ty->size, 0, (unsigned)v->ofs);
+}
+
+static void dbg_stash_scope(Obj *fn, Scope *sc) {
+  for (Obj *v = sc->locals; v; v = v->next)
+    dbg_stash_var(fn, v);
+  for (Scope *s = sc->children; s; s = s->sibling_next)
+    dbg_stash_scope(fn, s);
+}
+
 static MIR_reg_t local_addr(Obj *var) {
   if (var->ptr != mir_local_marker)
     internal_error();
@@ -2041,6 +2077,11 @@ void emit_text(Obj *fn) {
     else
       store_scalar(p->ty, local_addr(p), 0, arg);
   }
+
+  // Record parameters and locals (params first so they win the dedup) for
+  // debug info, now that each has its stack-address register assigned.
+  if (opt_g)
+    dbg_stash_scope(fn, fn->ty->scopes);
 
   gen_stmt(fn->body);
 

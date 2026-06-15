@@ -600,6 +600,14 @@ void slimcc_shutdown(void) {
 #define SLIMCC_ELF_MACHINE EM_NONE
 #endif
 
+// DWARF DW_OP_regN for the host frame pointer (DW_AT_frame_base): MIR keeps a
+// frame pointer for debug functions and reports slot offsets relative to it.
+#if defined(__aarch64__)
+#define SLIMCC_DW_OP_FP DW_OP_reg29
+#else
+#define SLIMCC_DW_OP_FP DW_OP_reg6
+#endif
+
 static int debug_obj_fail(char **errmsg, const char *msg) {
   if (errmsg) *errmsg = strdup(msg);
   return -1;
@@ -628,11 +636,47 @@ int slimcc_debug_intern_file(const char *name) {
   return dbg_files.len;
 }
 
+// Per-function local/parameter records for DWARF variable DIEs, accumulated
+// across a debug build like dbg_files and cleared by slimcc_debug_reset.
+typedef struct {
+  char *func, *name;
+  int enc, size, is_param;
+  unsigned reg;
+} DbgLocal;
+static struct {
+  DbgLocal *v;
+  int len, cap;
+} dbg_locals;
+
+void slimcc_debug_add_local(const char *func, const char *name, int enc, int size,
+                            int is_param, unsigned reg) {
+  for (int i = 0; i < dbg_locals.len; i++) // dedup param-vs-scope double listing
+    if (dbg_locals.v[i].reg == reg && strcmp(dbg_locals.v[i].func, func) == 0) return;
+  if (dbg_locals.len == dbg_locals.cap) {
+    dbg_locals.cap = dbg_locals.cap ? dbg_locals.cap * 2 : 16;
+    dbg_locals.v = realloc(dbg_locals.v, dbg_locals.cap * sizeof(DbgLocal));
+  }
+  DbgLocal *e = &dbg_locals.v[dbg_locals.len++];
+  e->func = strdup(func);
+  e->name = strdup(name);
+  e->enc = enc;
+  e->size = size;
+  e->is_param = is_param;
+  e->reg = reg;
+}
+
 void slimcc_debug_reset(void) {
   for (int i = 0; i < dbg_files.len; i++) free(dbg_files.names[i]);
   free(dbg_files.names);
   dbg_files.names = NULL;
   dbg_files.len = dbg_files.cap = 0;
+  for (int i = 0; i < dbg_locals.len; i++) {
+    free(dbg_locals.v[i].func);
+    free(dbg_locals.v[i].name);
+  }
+  free(dbg_locals.v);
+  dbg_locals.v = NULL;
+  dbg_locals.len = dbg_locals.cap = 0;
 }
 
 // ---- small growable byte buffer for assembling ELF/DWARF section bodies ----
@@ -684,9 +728,18 @@ static void buf_sleb(Buf *b, int64_t v) {
 enum {
   DW_TAG_compile_unit = 0x11,
   DW_TAG_subprogram = 0x2e,
+  DW_TAG_base_type = 0x24,
+  DW_TAG_pointer_type = 0x0f,
+  DW_TAG_variable = 0x34,
+  DW_TAG_formal_parameter = 0x05,
   DW_CHILDREN_no = 0,
   DW_CHILDREN_yes = 1,
   DW_AT_name = 0x03,
+  DW_AT_byte_size = 0x0b,
+  DW_AT_encoding = 0x3e,
+  DW_AT_location = 0x02,
+  DW_AT_type = 0x49,
+  DW_AT_frame_base = 0x40,
   DW_AT_stmt_list = 0x10,
   DW_AT_low_pc = 0x11,
   DW_AT_high_pc = 0x12,
@@ -695,10 +748,21 @@ enum {
   DW_AT_producer = 0x25,
   DW_AT_external = 0x3f,
   DW_FORM_addr = 0x01,
+  DW_FORM_data1 = 0x0b,
   DW_FORM_data2 = 0x05,
   DW_FORM_string = 0x08,
+  DW_FORM_ref4 = 0x13,
   DW_FORM_flag = 0x0c,
+  DW_FORM_exprloc = 0x18,
   DW_FORM_sec_offset = 0x17,
+  DW_ATE_boolean = 0x02,
+  DW_ATE_float = 0x04,
+  DW_ATE_signed = 0x05,
+  DW_ATE_unsigned = 0x07,
+  DW_OP_deref = 0x06,
+  DW_OP_fbreg = 0x91,
+  DW_OP_reg6 = 0x56,  // x86_64 rbp
+  DW_OP_reg29 = 0x6d, // aarch64 x29
   DW_LANG_C99 = 0x0c,
   DW_LNS_copy = 1,
   DW_LNS_advance_pc = 2,
@@ -709,7 +773,8 @@ enum {
   DW_LNE_set_address = 2,
 };
 
-// .debug_abbrev: abbrev 1 = compile_unit (has children), 2 = subprogram (leaf).
+// .debug_abbrev: 1=compile_unit, 2=subprogram, 3=base_type, 4=pointer_type,
+// 5=variable, 6=formal_parameter.
 static void dwarf_abbrev(Buf *b) {
   buf_uleb(b, 1);
   buf_uleb(b, DW_TAG_compile_unit);
@@ -724,16 +789,64 @@ static void dwarf_abbrev(Buf *b) {
   buf_uleb(b, 0); buf_uleb(b, 0);
   buf_uleb(b, 2);
   buf_uleb(b, DW_TAG_subprogram);
-  buf_u8(b, DW_CHILDREN_no);
-  buf_uleb(b, DW_AT_name);     buf_uleb(b, DW_FORM_string);
-  buf_uleb(b, DW_AT_low_pc);   buf_uleb(b, DW_FORM_addr);
-  buf_uleb(b, DW_AT_high_pc);  buf_uleb(b, DW_FORM_addr);
-  buf_uleb(b, DW_AT_external); buf_uleb(b, DW_FORM_flag);
+  buf_u8(b, DW_CHILDREN_yes);
+  buf_uleb(b, DW_AT_name);       buf_uleb(b, DW_FORM_string);
+  buf_uleb(b, DW_AT_low_pc);     buf_uleb(b, DW_FORM_addr);
+  buf_uleb(b, DW_AT_high_pc);    buf_uleb(b, DW_FORM_addr);
+  buf_uleb(b, DW_AT_frame_base); buf_uleb(b, DW_FORM_exprloc);
+  buf_uleb(b, DW_AT_external);   buf_uleb(b, DW_FORM_flag);
   buf_uleb(b, 0); buf_uleb(b, 0);
+  buf_uleb(b, 3);
+  buf_uleb(b, DW_TAG_base_type);
+  buf_u8(b, DW_CHILDREN_no);
+  buf_uleb(b, DW_AT_name);      buf_uleb(b, DW_FORM_string);
+  buf_uleb(b, DW_AT_encoding);  buf_uleb(b, DW_FORM_data1);
+  buf_uleb(b, DW_AT_byte_size); buf_uleb(b, DW_FORM_data1);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+  buf_uleb(b, 4);
+  buf_uleb(b, DW_TAG_pointer_type);
+  buf_u8(b, DW_CHILDREN_no);
+  buf_uleb(b, DW_AT_byte_size); buf_uleb(b, DW_FORM_data1);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+  for (int tag = 5; tag <= 6; tag++) { // variable, formal_parameter share a shape
+    buf_uleb(b, tag);
+    buf_uleb(b, tag == 5 ? DW_TAG_variable : DW_TAG_formal_parameter);
+    buf_u8(b, DW_CHILDREN_no);
+    buf_uleb(b, DW_AT_name);     buf_uleb(b, DW_FORM_string);
+    buf_uleb(b, DW_AT_type);     buf_uleb(b, DW_FORM_ref4);
+    buf_uleb(b, DW_AT_location); buf_uleb(b, DW_FORM_exprloc);
+    buf_uleb(b, 0); buf_uleb(b, 0);
+  }
   buf_uleb(b, 0); // end of table
 }
 
-// .debug_info: one CU with a subprogram DIE per function symbol.
+// The fixed set of base types we emit, indexed by base_type_index().
+static const struct {
+  const char *name;
+  int ate, size;
+} slimcc_base_types[] = {
+  {"signed char", DW_ATE_signed, 1},    {"short", DW_ATE_signed, 2},
+  {"int", DW_ATE_signed, 4},            {"long", DW_ATE_signed, 8},
+  {"unsigned char", DW_ATE_unsigned, 1},{"unsigned short", DW_ATE_unsigned, 2},
+  {"unsigned int", DW_ATE_unsigned, 4}, {"unsigned long", DW_ATE_unsigned, 8},
+  {"float", DW_ATE_float, 4},           {"double", DW_ATE_float, 8},
+  {"long double", DW_ATE_float, 16},    {"_Bool", DW_ATE_boolean, 1},
+};
+#define SLIMCC_NBASE ((int)(sizeof slimcc_base_types / sizeof slimcc_base_types[0]))
+
+static int base_type_index(int enc, int size) {
+  switch (enc) {
+  case SLIMCC_DBG_SIGNED:   return size >= 8 ? 3 : size >= 4 ? 2 : size >= 2 ? 1 : 0;
+  case SLIMCC_DBG_UNSIGNED: return size >= 8 ? 7 : size >= 4 ? 6 : size >= 2 ? 5 : 4;
+  case SLIMCC_DBG_FLOAT:    return size >= 16 ? 10 : size >= 8 ? 9 : 8;
+  case SLIMCC_DBG_BOOL:     return 11;
+  default:                  return -1; // pointer / unsupported
+  }
+}
+
+// .debug_info: a CU holding the base types, a generic pointer type, and a
+// subprogram DIE per function with a child variable/parameter DIE (located
+// relative to the frame pointer) for each scalar local recorded by the compiler.
 static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
                        uint64_t text_base, uint64_t text_size, const char *cu_name) {
   size_t unit_len_pos = b->len;
@@ -750,13 +863,52 @@ static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
   buf_u64(b, text_base);
   buf_u64(b, text_base + text_size);
   buf_u32(b, 0); // stmt_list -> .debug_line offset 0
+
+  // Base types + a void* pointer type, remembering each DIE's CU-relative offset
+  // (what DW_FORM_ref4 references).
+  uint32_t base_off[SLIMCC_NBASE], ptr_off;
+  for (int t = 0; t < SLIMCC_NBASE; t++) {
+    base_off[t] = (uint32_t)(b->len - unit_len_pos);
+    buf_uleb(b, 3);
+    buf_str(b, slimcc_base_types[t].name);
+    buf_u8(b, (uint8_t)slimcc_base_types[t].ate);
+    buf_u8(b, (uint8_t)slimcc_base_types[t].size);
+  }
+  ptr_off = (uint32_t)(b->len - unit_len_pos);
+  buf_uleb(b, 4);
+  buf_u8(b, 8); // pointer byte size
+
   for (int i = 0; i < nsyms; i++) {
     if (!syms[i].is_func || !syms[i].addr) continue;
-    buf_uleb(b, 2); // subprogram abbrev
+    buf_uleb(b, 2); // subprogram
     buf_str(b, syms[i].name ? syms[i].name : "");
     buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr);
     buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr + syms[i].size);
+    buf_u8(b, 1); buf_u8(b, SLIMCC_DW_OP_FP); // frame_base = exprloc{DW_OP_regFP}
     buf_u8(b, 1); // external
+    // Child variable DIEs for this function's recorded locals.
+    MIR_func_t fn = (MIR_func_t)syms[i].mir_func;
+    if (fn != NULL) {
+      for (int k = 0; k < dbg_locals.len; k++) {
+        DbgLocal *d = &dbg_locals.v[k];
+        if (strcmp(d->func, syms[i].name ? syms[i].name : "") != 0) continue;
+        int64_t off;
+        if (!MIR_reg_frame_offset(fn, d->reg, &off)) continue; // not stack-homed
+        uint32_t tref = d->enc == SLIMCC_DBG_PTR ? ptr_off
+                                                 : base_off[base_type_index(d->enc, d->size)];
+        buf_uleb(b, d->is_param ? 6 : 5);
+        buf_str(b, d->name);
+        buf_u32(b, tref);
+        // location = DW_OP_fbreg(off), DW_OP_deref: the slot holds the variable's
+        // address (the alloca pointer), so dereference to reach the variable.
+        Buf e = {0};
+        buf_u8(&e, DW_OP_fbreg); buf_sleb(&e, off); buf_u8(&e, DW_OP_deref);
+        buf_uleb(b, e.len);
+        buf_bytes(b, e.p, e.len);
+        free(e.p);
+      }
+    }
+    buf_u8(b, 0); // end subprogram children
   }
   buf_u8(b, 0); // end of CU children
   uint32_t unit_len = (uint32_t)(b->len - after_len);

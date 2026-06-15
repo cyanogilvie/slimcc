@@ -74,6 +74,12 @@ typedef struct slimcc_jitsym {
   // debug file table (see slimcc_debug_intern_file).
   const MIR_line_map_t *line_map;
   size_t line_map_len;
+  // Optional: the MIR_func_t (as void*) this symbol came from. When set (and the
+  // module was generated in spill-all mode), slimcc_debug_obj also emits
+  // DW_TAG_variable DIEs with frame-relative locations for the function's
+  // locals, so a debugger can inspect them. The locals themselves are recorded
+  // by the compiler via slimcc_debug_add_local.
+  const void *mir_func;
 } slimcc_jitsym;
 
 // Build a minimal ELF object (ET_REL, host machine) holding a .symtab over the
