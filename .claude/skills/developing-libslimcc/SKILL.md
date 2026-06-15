@@ -20,7 +20,7 @@ The parser→backend boundary is exactly 7 symbols declared in slimcc.h (~line 1
 | File | Role |
 |---|---|
 | `codegen-mir.c` / `codegen-mir.h` | The backend: AST → MIR via the direct C API |
-| `libslimcc.c` / `libslimcc.h` | Public API: `slimcc_compile()` + `slimcc_register_helpers()` + `slimcc_pch_*` (header cache); error longjmp, global resets, vfile registry, embedded headers, dep/mtime recorder |
+| `libslimcc.c` / `libslimcc.h` | Public API: `slimcc_compile()` + `slimcc_register_helpers()` + `slimcc_pch_*` (header cache) + `slimcc_debug_obj()` (GDB JIT-interface symbol ELF); error longjmp, global resets, vfile registry, embedded headers, dep/mtime recorder |
 | `preprocess.c` (additive only) | `pp_snapshot`/`pp_install`/`pp_free_state` — the pch snapshot engine (lives here because `Macro` is private to this TU) |
 | `slimcc-mir-helpers.c` | Host-compiled runtime helpers registered via `MIR_load_external` |
 | `platform/mir.c` | Host-arch predefined macros, type policies (unsigned plain char + unsigned wchar_t on aarch64), stub assembler/linker hooks |
@@ -79,6 +79,12 @@ Invariants the snapshot must preserve (each cost a test-suite failure to find �
 - **The fast path skips `init_macros`/`platform_init_cc1`/`lib_macros`** (all baked into the pch via the matching-key guarantee) but must NOT skip the non-macro target setup — except `init_ty_lp64()`'s type globals (`ty_size_t`, `enum_ty`, …) are process-persistent (`type_reset` only clears `void_ptr_cache`) and set when the pch was built, so re-running it would just re-`#define` its macros and churn/leak the table. So: call nothing.
 
 Validation harness pattern: an *oracle* (same program compiled inline vs via pch must produce identical run output), ASAN for the freeing invariants, and an RSS-over-N-compiles loop for leaks (production build = `tok_pooled()`, bulk-freed; ASAN build = `EAGER_FREE`, individual free — both must be clean). The function-like-variadic and multi-line-`-D` cases only surface through the real jitc suite (`capply-6.5`), so run it.
+
+## GDB JIT debug symbols (`slimcc_debug_obj`)
+
+MIR emits no DWARF, so JIT'd frames are anonymous. `slimcc_debug_obj(syms, n, &buf, &size, &err)` builds a minimal in-memory ELF (ET_REL, host machine) naming the generated functions, for registration via the GDB JIT interface (`__jit_debug_register_code` — the consumer, e.g. jitc, owns the descriptor/register/unregister). Sizes come from MIR's `MIR_func.code_len` (a fork addition — `mir` branch `expose-func-code-len`→`meson`). This is function-granularity only (named `bt` frames, `break funcname`, labeled `disas`); line stepping / variable inspection would need a cross-cutting MIR insn-`loc` field plus a DWARF line program / type DIEs.
+
+**Invariant (cost the whole feature to find):** gdb's JIT reader only materializes symbols that fall inside an **allocatable section**. A symtab-only object with `SHN_ABS` symbols loads but yields *nothing* breakable. So anchor every symbol to one `SHT_NOBITS .text` section spanning their address range, defined section-relative (`st_shndx`=.text, `st_value`=addr−base); gdb reads the actual instructions from inferior memory at `sh_addr`. Keep the address span tight (functions only — MIR keeps a context's data far from its code, which would balloon the section). The writer is pure ELF, no compiler/MIR state, reusable by any MIR embedder. Validate with `readelf -sSW` on the emitted object (symbols should show `FUNC … Ndx 1`) and a real gdb session breaking on a JIT'd function by name.
 
 ## Status & next steps
 
