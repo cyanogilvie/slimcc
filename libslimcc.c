@@ -636,49 +636,6 @@ int slimcc_debug_intern_file(const char *name) {
   return dbg_files.len;
 }
 
-// Per-function local/parameter records for DWARF variable DIEs, accumulated
-// across a debug build like dbg_files and cleared by slimcc_debug_reset.
-typedef struct {
-  char *func, *name;
-  int enc, size, is_param;
-  unsigned reg;
-} DbgLocal;
-static struct {
-  DbgLocal *v;
-  int len, cap;
-} dbg_locals;
-
-void slimcc_debug_add_local(const char *func, const char *name, int enc, int size,
-                            int is_param, unsigned reg) {
-  for (int i = 0; i < dbg_locals.len; i++) // dedup param-vs-scope double listing
-    if (dbg_locals.v[i].reg == reg && strcmp(dbg_locals.v[i].func, func) == 0) return;
-  if (dbg_locals.len == dbg_locals.cap) {
-    dbg_locals.cap = dbg_locals.cap ? dbg_locals.cap * 2 : 16;
-    dbg_locals.v = realloc(dbg_locals.v, dbg_locals.cap * sizeof(DbgLocal));
-  }
-  DbgLocal *e = &dbg_locals.v[dbg_locals.len++];
-  e->func = strdup(func);
-  e->name = strdup(name);
-  e->enc = enc;
-  e->size = size;
-  e->is_param = is_param;
-  e->reg = reg;
-}
-
-void slimcc_debug_reset(void) {
-  for (int i = 0; i < dbg_files.len; i++) free(dbg_files.names[i]);
-  free(dbg_files.names);
-  dbg_files.names = NULL;
-  dbg_files.len = dbg_files.cap = 0;
-  for (int i = 0; i < dbg_locals.len; i++) {
-    free(dbg_locals.v[i].func);
-    free(dbg_locals.v[i].name);
-  }
-  free(dbg_locals.v);
-  dbg_locals.v = NULL;
-  dbg_locals.len = dbg_locals.cap = 0;
-}
-
 // ---- small growable byte buffer for assembling ELF/DWARF section bodies ----
 typedef struct {
   unsigned char *p;
@@ -732,14 +689,32 @@ enum {
   DW_TAG_pointer_type = 0x0f,
   DW_TAG_variable = 0x34,
   DW_TAG_formal_parameter = 0x05,
+  DW_TAG_structure_type = 0x13,
+  DW_TAG_union_type = 0x17,
+  DW_TAG_array_type = 0x01,
+  DW_TAG_subrange_type = 0x21,
+  DW_TAG_enumeration_type = 0x04,
+  DW_TAG_enumerator = 0x28,
+  DW_TAG_member = 0x0d,
+  DW_TAG_typedef = 0x16,
+  DW_TAG_const_type = 0x26,
+  DW_TAG_volatile_type = 0x35,
+  DW_TAG_unspecified_type = 0x3b,
+  DW_TAG_subroutine_type = 0x15,
   DW_CHILDREN_no = 0,
   DW_CHILDREN_yes = 1,
   DW_AT_name = 0x03,
   DW_AT_byte_size = 0x0b,
+  DW_AT_bit_size = 0x0d,
   DW_AT_encoding = 0x3e,
   DW_AT_location = 0x02,
   DW_AT_type = 0x49,
   DW_AT_frame_base = 0x40,
+  DW_AT_data_member_location = 0x38,
+  DW_AT_data_bit_offset = 0x6b,
+  DW_AT_count = 0x37,
+  DW_AT_const_value = 0x1c,
+  DW_AT_declaration = 0x3c,
   DW_AT_stmt_list = 0x10,
   DW_AT_low_pc = 0x11,
   DW_AT_high_pc = 0x12,
@@ -750,15 +725,22 @@ enum {
   DW_FORM_addr = 0x01,
   DW_FORM_data1 = 0x0b,
   DW_FORM_data2 = 0x05,
+  DW_FORM_data4 = 0x06,
+  DW_FORM_data8 = 0x07,
+  DW_FORM_sdata = 0x0d,
+  DW_FORM_udata = 0x0f,
   DW_FORM_string = 0x08,
   DW_FORM_ref4 = 0x13,
   DW_FORM_flag = 0x0c,
+  DW_FORM_flag_present = 0x19,
   DW_FORM_exprloc = 0x18,
   DW_FORM_sec_offset = 0x17,
   DW_ATE_boolean = 0x02,
   DW_ATE_float = 0x04,
   DW_ATE_signed = 0x05,
+  DW_ATE_signed_char = 0x06,
   DW_ATE_unsigned = 0x07,
+  DW_ATE_unsigned_char = 0x08,
   DW_OP_deref = 0x06,
   DW_OP_fbreg = 0x91,
   DW_OP_reg6 = 0x56,  // x86_64 rbp
@@ -773,80 +755,387 @@ enum {
   DW_LNE_set_address = 2,
 };
 
+// ---- Persistent debug-type IR (interned from slimcc Types) ----------------
+// A self-contained type graph snapshotted while the slimcc Type is still valid
+// (its arena is recycled per compile), accumulated across a debug build and
+// cleared by slimcc_debug_reset. The DWARF emitter walks this, not slimcc's
+// internals. Type index 0 is always "void".
+enum {
+  DT_VOID, DT_BASE, DT_PTR, DT_ARRAY, DT_STRUCT, DT_UNION,
+  DT_ENUM, DT_TYPEDEF, DT_FUNC
+};
+typedef struct {
+  int kind;
+  int enc;       // DT_BASE: DW_ATE_*
+  int64_t size;  // byte size (0 = unknown/void)
+  int ref;       // referenced type (ptr-to / array-elem / func-return), or -1
+  char *name;    // type name, or NULL (anonymous)
+  int64_t count; // DT_ARRAY: element count, or -1 if unknown
+  int memb, nmemb; // DT_STRUCT/UNION/ENUM/FUNC: contiguous slice of dbg_members
+} DbgType;
+typedef struct {
+  char *name;   // member / enumerator / param name, or NULL
+  int type;     // member / param type index; -1 for an enumerator
+  int64_t off;  // member byte offset; or enumerator const value
+  int bit_size; // bitfield width (0 = not a bitfield)
+  int bit_off;  // bitfield's absolute bit offset from the object start
+} DbgMember;
+
+static struct { DbgType *v; int len, cap; } dbg_types;
+static struct { DbgMember *v; int len, cap; } dbg_members;
+typedef struct { char *func, *name; int type, is_param; unsigned reg; } DbgLocal;
+static struct { DbgLocal *v; int len, cap; } dbg_locals;
+// Per-add_local cycle map (Type* -> type index): recursive structs reference
+// themselves, so a node is registered before its members are interned.
+static struct { Type **k; int *v; int len, cap; } dbg_visit;
+
+static char *dbg_strndup(const char *s, int n) {
+  char *r = malloc(n + 1);
+  memcpy(r, s, n);
+  r[n] = 0;
+  return r;
+}
+static int dbg_new_type(void) {
+  if (dbg_types.len == dbg_types.cap) {
+    dbg_types.cap = dbg_types.cap ? dbg_types.cap * 2 : 32;
+    dbg_types.v = realloc(dbg_types.v, dbg_types.cap * sizeof(DbgType));
+  }
+  int i = dbg_types.len++;
+  dbg_types.v[i] = (DbgType){.kind = DT_VOID, .ref = -1, .count = -1, .memb = -1};
+  return i;
+}
+static void dbg_visit_add(Type *ty, int idx) {
+  if (dbg_visit.len == dbg_visit.cap) {
+    dbg_visit.cap = dbg_visit.cap ? dbg_visit.cap * 2 : 16;
+    dbg_visit.k = realloc(dbg_visit.k, dbg_visit.cap * sizeof(Type *));
+    dbg_visit.v = realloc(dbg_visit.v, dbg_visit.cap * sizeof(int));
+  }
+  dbg_visit.k[dbg_visit.len] = ty;
+  dbg_visit.v[dbg_visit.len] = idx;
+  dbg_visit.len++;
+}
+static int dbg_push_member(char *name, int type, int64_t off, int bsz, int boff) {
+  if (dbg_members.len == dbg_members.cap) {
+    dbg_members.cap = dbg_members.cap ? dbg_members.cap * 2 : 64;
+    dbg_members.v = realloc(dbg_members.v, dbg_members.cap * sizeof(DbgMember));
+  }
+  int i = dbg_members.len++;
+  dbg_members.v[i] = (DbgMember){.name = name, .type = type, .off = off, .bit_size = bsz, .bit_off = boff};
+  return i;
+}
+
+static int intern_type(Type *ty);
+
+// A base (scalar) type: pick a DWARF encoding + canonical name from the kind.
+static int intern_base(Type *ty, int enc, const char *name) {
+  int i = dbg_new_type();
+  dbg_visit_add(ty, i);
+  DbgType *t = &dbg_types.v[i];
+  t->kind = DT_BASE;
+  t->enc = enc;
+  t->size = ty->size;
+  t->name = strdup(name);
+  return i;
+}
+
+static int intern_type(Type *ty) {
+  if (ty == NULL || ty->kind == TY_VOID) return 0; // 0 == void
+  int seen;
+  for (seen = 0; seen < dbg_visit.len; seen++)
+    if (dbg_visit.k[seen] == ty) return dbg_visit.v[seen];
+
+  // Enum variables carry their underlying integer kind but keep the enumerator
+  // list; emit a real enumeration_type so a debugger shows enumerator names.
+  if (ty->enums != NULL && ty->kind != TY_ENUM) {
+    int i = dbg_new_type();
+    dbg_visit_add(ty, i);
+    int start = dbg_members.len, n = 0;
+    for (EnumVal *e = ty->enums; e; e = e->next) {
+      dbg_push_member(e->name ? dbg_strndup(e->name->loc, e->name->len) : NULL, -1, e->val, 0, 0);
+      n++;
+    }
+    DbgType *t = &dbg_types.v[i];
+    t->kind = DT_ENUM;
+    t->size = ty->size;
+    t->name = ty->tag ? dbg_strndup(ty->tag->loc, ty->tag->len) : NULL;
+    t->memb = start;
+    t->nmemb = n;
+    return i;
+  }
+
+  switch (ty->kind) {
+  case TY_BOOL: return intern_base(ty, DW_ATE_boolean, "_Bool");
+  case TY_FLOAT: return intern_base(ty, DW_ATE_float, "float");
+  case TY_DOUBLE: return intern_base(ty, DW_ATE_float, "double");
+  case TY_LDOUBLE: return intern_base(ty, DW_ATE_float, "long double");
+  case TY_PCHAR: case TY_CHAR:
+    return intern_base(ty, ty->is_unsigned ? DW_ATE_unsigned_char : DW_ATE_signed_char,
+                       ty->is_unsigned ? "unsigned char" : "char");
+  case TY_SHORT:
+    return intern_base(ty, ty->is_unsigned ? DW_ATE_unsigned : DW_ATE_signed,
+                       ty->is_unsigned ? "unsigned short" : "short");
+  case TY_INT:
+    return intern_base(ty, ty->is_unsigned ? DW_ATE_unsigned : DW_ATE_signed,
+                       ty->is_unsigned ? "unsigned int" : "int");
+  case TY_LONG:
+    return intern_base(ty, ty->is_unsigned ? DW_ATE_unsigned : DW_ATE_signed,
+                       ty->is_unsigned ? "unsigned long" : "long");
+  case TY_LONGLONG:
+    return intern_base(ty, ty->is_unsigned ? DW_ATE_unsigned : DW_ATE_signed,
+                       ty->is_unsigned ? "unsigned long long" : "long long");
+  case TY_BITINT:
+    return intern_base(ty, ty->is_unsigned ? DW_ATE_unsigned : DW_ATE_signed, "_BitInt");
+  case TY_PTR: case TY_NULLPTR: {
+    int i = dbg_new_type();
+    dbg_visit_add(ty, i);
+    int r = intern_type(ty->base); // may grow dbg_types -> re-index below
+    dbg_types.v[i].kind = DT_PTR;
+    dbg_types.v[i].size = ty->size;
+    dbg_types.v[i].ref = r;
+    return i;
+  }
+  case TY_ARRAY: {
+    int i = dbg_new_type();
+    dbg_visit_add(ty, i);
+    int r = intern_type(ty->base);
+    dbg_types.v[i].kind = DT_ARRAY;
+    dbg_types.v[i].size = ty->size;
+    dbg_types.v[i].ref = r;
+    dbg_types.v[i].count = ty->array_len;
+    return i;
+  }
+  case TY_STRUCT: case TY_UNION: {
+    int i = dbg_new_type();
+    dbg_visit_add(ty, i);
+    // Intern member types first (may add more types/members), collecting their
+    // indices, then append this aggregate's members contiguously.
+    int n = 0;
+    for (Member *m = ty->members; m; m = m->next) n++;
+    int *mtypes = n ? malloc(n * sizeof(int)) : NULL;
+    int k = 0;
+    for (Member *m = ty->members; m; m = m->next) mtypes[k++] = intern_type(m->ty);
+    int start = dbg_members.len;
+    k = 0;
+    for (Member *m = ty->members; m; m = m->next, k++) {
+      char *nm = m->name ? dbg_strndup(m->name->loc, m->name->len) : NULL;
+      int bsz = m->is_bitfield ? m->bit_width : 0;
+      int boff = m->is_bitfield ? (int)(m->offset * 8 + m->bit_offset) : 0;
+      dbg_push_member(nm, mtypes[k], m->offset, bsz, boff);
+    }
+    free(mtypes);
+    DbgType *t = &dbg_types.v[i];
+    t->kind = ty->kind == TY_UNION ? DT_UNION : DT_STRUCT;
+    t->size = ty->size;
+    t->name = ty->tag ? dbg_strndup(ty->tag->loc, ty->tag->len) : NULL;
+    t->memb = start;
+    t->nmemb = n;
+    return i;
+  }
+  case TY_ENUM: {
+    int i = dbg_new_type();
+    dbg_visit_add(ty, i);
+    int start = dbg_members.len, n = 0;
+    for (EnumVal *e = ty->enums; e; e = e->next) {
+      char *nm = e->name ? dbg_strndup(e->name->loc, e->name->len) : NULL;
+      dbg_push_member(nm, -1, e->val, 0, 0);
+      n++;
+    }
+    DbgType *t = &dbg_types.v[i];
+    t->kind = DT_ENUM;
+    t->size = ty->size;
+    t->name = ty->tag ? dbg_strndup(ty->tag->loc, ty->tag->len) : NULL;
+    t->memb = start;
+    t->nmemb = n;
+    return i;
+  }
+  case TY_FUNC: {
+    int i = dbg_new_type();
+    dbg_visit_add(ty, i);
+    int rr = intern_type(ty->return_ty);
+    int n = 0;
+    for (Obj *p = ty->param_list; p; p = p->param_next) n++;
+    int *ptypes = n ? malloc(n * sizeof(int)) : NULL;
+    int k = 0;
+    for (Obj *p = ty->param_list; p; p = p->param_next) ptypes[k++] = intern_type(p->ty);
+    int start = dbg_members.len;
+    for (k = 0; k < n; k++) dbg_push_member(NULL, ptypes[k], 0, 0, 0);
+    free(ptypes);
+    DbgType *t = &dbg_types.v[i];
+    t->kind = DT_FUNC;
+    t->ref = rr;
+    t->memb = start;
+    t->nmemb = n;
+    return i;
+  }
+  default: // VLA, _BitInt>handled, auto, asm, ... -> describe as void
+    return 0;
+  }
+}
+
+void slimcc_debug_add_local(const char *func, const char *name, Type *ty,
+                            int is_param, unsigned reg) {
+  for (int i = 0; i < dbg_locals.len; i++) // dedup param-vs-scope double listing
+    if (dbg_locals.v[i].reg == reg && strcmp(dbg_locals.v[i].func, func) == 0) return;
+  if (dbg_types.len == 0) { // seed index 0 = void
+    int v = dbg_new_type();
+    dbg_types.v[v].kind = DT_VOID;
+    dbg_types.v[v].name = strdup("void");
+  }
+  dbg_visit.len = 0;
+  int type = intern_type(ty);
+  if (dbg_locals.len == dbg_locals.cap) {
+    dbg_locals.cap = dbg_locals.cap ? dbg_locals.cap * 2 : 16;
+    dbg_locals.v = realloc(dbg_locals.v, dbg_locals.cap * sizeof(DbgLocal));
+  }
+  dbg_locals.v[dbg_locals.len++] =
+    (DbgLocal){.func = strdup(func), .name = strdup(name), .type = type,
+               .is_param = is_param, .reg = reg};
+}
+
+void slimcc_debug_reset(void) {
+  for (int i = 0; i < dbg_files.len; i++) free(dbg_files.names[i]);
+  free(dbg_files.names);
+  dbg_files.names = NULL;
+  dbg_files.len = dbg_files.cap = 0;
+  for (int i = 0; i < dbg_types.len; i++) free(dbg_types.v[i].name);
+  free(dbg_types.v);
+  dbg_types.v = NULL;
+  dbg_types.len = dbg_types.cap = 0;
+  for (int i = 0; i < dbg_members.len; i++) free(dbg_members.v[i].name);
+  free(dbg_members.v);
+  dbg_members.v = NULL;
+  dbg_members.len = dbg_members.cap = 0;
+  for (int i = 0; i < dbg_locals.len; i++) {
+    free(dbg_locals.v[i].func);
+    free(dbg_locals.v[i].name);
+  }
+  free(dbg_locals.v);
+  dbg_locals.v = NULL;
+  dbg_locals.len = dbg_locals.cap = 0;
+  free(dbg_visit.k);
+  free(dbg_visit.v);
+  dbg_visit.k = NULL;
+  dbg_visit.v = NULL;
+  dbg_visit.len = dbg_visit.cap = 0;
+}
+
 // .debug_abbrev: 1=compile_unit, 2=subprogram, 3=base_type, 4=pointer_type,
 // 5=variable, 6=formal_parameter.
+// Abbrev codes (must match what dwarf_info emits).
+enum {
+  A_CU = 1, A_SUBPROG, A_BASE, A_PTR, A_VAR, A_PARAM, A_VOIDT,
+  A_STRUCT, A_UNION, A_MEMBER, A_MEMBERBF, A_ARRAY, A_SUBRANGE, A_SUBRANGE0,
+  A_ENUM, A_ENUMERATOR, A_SUBR, A_FPARAM,
+};
+
+static void abbrev_attr(Buf *b, int at, int form) { buf_uleb(b, at); buf_uleb(b, form); }
+static void abbrev_hdr(Buf *b, int code, int tag, int children) {
+  buf_uleb(b, code); buf_uleb(b, tag); buf_u8(b, children);
+}
+
 static void dwarf_abbrev(Buf *b) {
-  buf_uleb(b, 1);
-  buf_uleb(b, DW_TAG_compile_unit);
-  buf_u8(b, DW_CHILDREN_yes);
-  buf_uleb(b, DW_AT_producer);  buf_uleb(b, DW_FORM_string);
-  buf_uleb(b, DW_AT_language);  buf_uleb(b, DW_FORM_data2);
-  buf_uleb(b, DW_AT_name);      buf_uleb(b, DW_FORM_string);
-  buf_uleb(b, DW_AT_comp_dir);  buf_uleb(b, DW_FORM_string);
-  buf_uleb(b, DW_AT_low_pc);    buf_uleb(b, DW_FORM_addr);
-  buf_uleb(b, DW_AT_high_pc);   buf_uleb(b, DW_FORM_addr);
-  buf_uleb(b, DW_AT_stmt_list); buf_uleb(b, DW_FORM_sec_offset);
+  abbrev_hdr(b, A_CU, DW_TAG_compile_unit, DW_CHILDREN_yes);
+  abbrev_attr(b, DW_AT_producer, DW_FORM_string);
+  abbrev_attr(b, DW_AT_language, DW_FORM_data2);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_comp_dir, DW_FORM_string);
+  abbrev_attr(b, DW_AT_low_pc, DW_FORM_addr);
+  abbrev_attr(b, DW_AT_high_pc, DW_FORM_addr);
+  abbrev_attr(b, DW_AT_stmt_list, DW_FORM_sec_offset);
   buf_uleb(b, 0); buf_uleb(b, 0);
-  buf_uleb(b, 2);
-  buf_uleb(b, DW_TAG_subprogram);
-  buf_u8(b, DW_CHILDREN_yes);
-  buf_uleb(b, DW_AT_name);       buf_uleb(b, DW_FORM_string);
-  buf_uleb(b, DW_AT_low_pc);     buf_uleb(b, DW_FORM_addr);
-  buf_uleb(b, DW_AT_high_pc);    buf_uleb(b, DW_FORM_addr);
-  buf_uleb(b, DW_AT_frame_base); buf_uleb(b, DW_FORM_exprloc);
-  buf_uleb(b, DW_AT_external);   buf_uleb(b, DW_FORM_flag);
+
+  abbrev_hdr(b, A_SUBPROG, DW_TAG_subprogram, DW_CHILDREN_yes);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_low_pc, DW_FORM_addr);
+  abbrev_attr(b, DW_AT_high_pc, DW_FORM_addr);
+  abbrev_attr(b, DW_AT_frame_base, DW_FORM_exprloc);
+  abbrev_attr(b, DW_AT_external, DW_FORM_flag);
   buf_uleb(b, 0); buf_uleb(b, 0);
-  buf_uleb(b, 3);
-  buf_uleb(b, DW_TAG_base_type);
-  buf_u8(b, DW_CHILDREN_no);
-  buf_uleb(b, DW_AT_name);      buf_uleb(b, DW_FORM_string);
-  buf_uleb(b, DW_AT_encoding);  buf_uleb(b, DW_FORM_data1);
-  buf_uleb(b, DW_AT_byte_size); buf_uleb(b, DW_FORM_data1);
+
+  abbrev_hdr(b, A_BASE, DW_TAG_base_type, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_encoding, DW_FORM_data1);
+  abbrev_attr(b, DW_AT_byte_size, DW_FORM_data1);
   buf_uleb(b, 0); buf_uleb(b, 0);
-  buf_uleb(b, 4);
-  buf_uleb(b, DW_TAG_pointer_type);
-  buf_u8(b, DW_CHILDREN_no);
-  buf_uleb(b, DW_AT_byte_size); buf_uleb(b, DW_FORM_data1);
+
+  abbrev_hdr(b, A_PTR, DW_TAG_pointer_type, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_byte_size, DW_FORM_data1);
+  abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
   buf_uleb(b, 0); buf_uleb(b, 0);
-  for (int tag = 5; tag <= 6; tag++) { // variable, formal_parameter share a shape
-    buf_uleb(b, tag);
-    buf_uleb(b, tag == 5 ? DW_TAG_variable : DW_TAG_formal_parameter);
-    buf_u8(b, DW_CHILDREN_no);
-    buf_uleb(b, DW_AT_name);     buf_uleb(b, DW_FORM_string);
-    buf_uleb(b, DW_AT_type);     buf_uleb(b, DW_FORM_ref4);
-    buf_uleb(b, DW_AT_location); buf_uleb(b, DW_FORM_exprloc);
+
+  for (int v = 0; v < 2; v++) { // A_VAR, A_PARAM
+    abbrev_hdr(b, v ? A_PARAM : A_VAR, v ? DW_TAG_formal_parameter : DW_TAG_variable,
+               DW_CHILDREN_no);
+    abbrev_attr(b, DW_AT_name, DW_FORM_string);
+    abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    abbrev_attr(b, DW_AT_location, DW_FORM_exprloc);
     buf_uleb(b, 0); buf_uleb(b, 0);
   }
+
+  abbrev_hdr(b, A_VOIDT, DW_TAG_unspecified_type, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  for (int u = 0; u < 2; u++) { // A_STRUCT, A_UNION
+    abbrev_hdr(b, u ? A_UNION : A_STRUCT, u ? DW_TAG_union_type : DW_TAG_structure_type,
+               DW_CHILDREN_yes);
+    abbrev_attr(b, DW_AT_name, DW_FORM_string);
+    abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    buf_uleb(b, 0); buf_uleb(b, 0);
+  }
+
+  abbrev_hdr(b, A_MEMBER, DW_TAG_member, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+  abbrev_attr(b, DW_AT_data_member_location, DW_FORM_udata);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_MEMBERBF, DW_TAG_member, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+  abbrev_attr(b, DW_AT_data_bit_offset, DW_FORM_udata);
+  abbrev_attr(b, DW_AT_bit_size, DW_FORM_udata);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_ARRAY, DW_TAG_array_type, DW_CHILDREN_yes);
+  abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_SUBRANGE, DW_TAG_subrange_type, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_count, DW_FORM_udata);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_SUBRANGE0, DW_TAG_subrange_type, DW_CHILDREN_no);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_ENUM, DW_TAG_enumeration_type, DW_CHILDREN_yes);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_ENUMERATOR, DW_TAG_enumerator, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_name, DW_FORM_string);
+  abbrev_attr(b, DW_AT_const_value, DW_FORM_sdata);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_SUBR, DW_TAG_subroutine_type, DW_CHILDREN_yes);
+  abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
+  abbrev_hdr(b, A_FPARAM, DW_TAG_formal_parameter, DW_CHILDREN_no);
+  abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+  buf_uleb(b, 0); buf_uleb(b, 0);
+
   buf_uleb(b, 0); // end of table
 }
 
-// The fixed set of base types we emit, indexed by base_type_index().
-static const struct {
-  const char *name;
-  int ate, size;
-} slimcc_base_types[] = {
-  {"signed char", DW_ATE_signed, 1},    {"short", DW_ATE_signed, 2},
-  {"int", DW_ATE_signed, 4},            {"long", DW_ATE_signed, 8},
-  {"unsigned char", DW_ATE_unsigned, 1},{"unsigned short", DW_ATE_unsigned, 2},
-  {"unsigned int", DW_ATE_unsigned, 4}, {"unsigned long", DW_ATE_unsigned, 8},
-  {"float", DW_ATE_float, 4},           {"double", DW_ATE_float, 8},
-  {"long double", DW_ATE_float, 16},    {"_Bool", DW_ATE_boolean, 1},
-};
-#define SLIMCC_NBASE ((int)(sizeof slimcc_base_types / sizeof slimcc_base_types[0]))
+// .debug_info: a CU holding the interned type graph (base/pointer/struct/union/
+// array/enum/function types) followed by a subprogram DIE per function, each
+// with a child variable/parameter DIE (located relative to the frame pointer)
+// for every local the compiler recorded. Inter-type ref4s are backpatched after
+// all type DIEs are laid out, since recursive types reference forward.
+typedef struct { size_t pos; int target; } TFix;
 
-static int base_type_index(int enc, int size) {
-  switch (enc) {
-  case SLIMCC_DBG_SIGNED:   return size >= 8 ? 3 : size >= 4 ? 2 : size >= 2 ? 1 : 0;
-  case SLIMCC_DBG_UNSIGNED: return size >= 8 ? 7 : size >= 4 ? 6 : size >= 2 ? 5 : 4;
-  case SLIMCC_DBG_FLOAT:    return size >= 16 ? 10 : size >= 8 ? 9 : 8;
-  case SLIMCC_DBG_BOOL:     return 11;
-  default:                  return -1; // pointer / unsupported
-  }
-}
-
-// .debug_info: a CU holding the base types, a generic pointer type, and a
-// subprogram DIE per function with a child variable/parameter DIE (located
-// relative to the frame pointer) for each scalar local recorded by the compiler.
 static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
                        uint64_t text_base, uint64_t text_size, const char *cu_name) {
   size_t unit_len_pos = b->len;
@@ -855,7 +1144,7 @@ static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
   buf_u16(b, 4);  // DWARF version
   buf_u32(b, 0);  // .debug_abbrev offset
   buf_u8(b, 8);   // address size
-  buf_uleb(b, 1); // CU abbrev code
+  buf_uleb(b, A_CU);
   buf_str(b, "slimcc");
   buf_u16(b, DW_LANG_C99);
   buf_str(b, cu_name ? cu_name : "cdef");
@@ -864,29 +1153,80 @@ static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
   buf_u64(b, text_base + text_size);
   buf_u32(b, 0); // stmt_list -> .debug_line offset 0
 
-  // Base types + a void* pointer type, remembering each DIE's CU-relative offset
-  // (what DW_FORM_ref4 references).
-  uint32_t base_off[SLIMCC_NBASE], ptr_off;
-  for (int t = 0; t < SLIMCC_NBASE; t++) {
-    base_off[t] = (uint32_t)(b->len - unit_len_pos);
-    buf_uleb(b, 3);
-    buf_str(b, slimcc_base_types[t].name);
-    buf_u8(b, (uint8_t)slimcc_base_types[t].ate);
-    buf_u8(b, (uint8_t)slimcc_base_types[t].size);
+  uint32_t *toff = dbg_types.len ? calloc(dbg_types.len, sizeof(uint32_t)) : NULL;
+  TFix *fix = NULL;
+  int nfix = 0, cfix = 0;
+#define REF(target_)                                                                \
+  do {                                                                              \
+    if (nfix == cfix) { cfix = cfix ? cfix * 2 : 64; fix = realloc(fix, cfix * sizeof(TFix)); } \
+    fix[nfix].pos = b->len; fix[nfix].target = (target_) < 0 ? 0 : (target_); nfix++; \
+    buf_u32(b, 0);                                                                   \
+  } while (0)
+
+  for (int t = 0; t < dbg_types.len; t++) {
+    DbgType *dt = &dbg_types.v[t];
+    toff[t] = (uint32_t)(b->len - unit_len_pos);
+    switch (dt->kind) {
+    case DT_BASE:
+      buf_uleb(b, A_BASE); buf_str(b, dt->name ? dt->name : "");
+      buf_u8(b, (uint8_t)dt->enc); buf_u8(b, (uint8_t)dt->size);
+      break;
+    case DT_PTR:
+      buf_uleb(b, A_PTR); buf_u8(b, (uint8_t)(dt->size ? dt->size : 8)); REF(dt->ref);
+      break;
+    case DT_STRUCT: case DT_UNION:
+      buf_uleb(b, dt->kind == DT_UNION ? A_UNION : A_STRUCT);
+      buf_str(b, dt->name ? dt->name : "");
+      buf_uleb(b, (uint64_t)dt->size);
+      for (int m = dt->memb; m < dt->memb + dt->nmemb; m++) {
+        DbgMember *dm = &dbg_members.v[m];
+        if (dm->bit_size > 0) {
+          buf_uleb(b, A_MEMBERBF); buf_str(b, dm->name ? dm->name : ""); REF(dm->type);
+          buf_uleb(b, (uint64_t)dm->bit_off); buf_uleb(b, (uint64_t)dm->bit_size);
+        } else {
+          buf_uleb(b, A_MEMBER); buf_str(b, dm->name ? dm->name : ""); REF(dm->type);
+          buf_uleb(b, (uint64_t)dm->off);
+        }
+      }
+      buf_u8(b, 0);
+      break;
+    case DT_ARRAY:
+      buf_uleb(b, A_ARRAY); REF(dt->ref);
+      if (dt->count >= 0) { buf_uleb(b, A_SUBRANGE); buf_uleb(b, (uint64_t)dt->count); }
+      else buf_uleb(b, A_SUBRANGE0);
+      buf_u8(b, 0);
+      break;
+    case DT_ENUM:
+      buf_uleb(b, A_ENUM); buf_str(b, dt->name ? dt->name : ""); buf_uleb(b, (uint64_t)dt->size);
+      for (int m = dt->memb; m < dt->memb + dt->nmemb; m++) {
+        DbgMember *dm = &dbg_members.v[m];
+        buf_uleb(b, A_ENUMERATOR); buf_str(b, dm->name ? dm->name : ""); buf_sleb(b, dm->off);
+      }
+      buf_u8(b, 0);
+      break;
+    case DT_FUNC:
+      buf_uleb(b, A_SUBR); REF(dt->ref);
+      for (int m = dt->memb; m < dt->memb + dt->nmemb; m++) {
+        buf_uleb(b, A_FPARAM); REF(dbg_members.v[m].type);
+      }
+      buf_u8(b, 0);
+      break;
+    default: // DT_VOID and anything unmodeled
+      buf_uleb(b, A_VOIDT); buf_str(b, dt->name ? dt->name : "void");
+      break;
+    }
   }
-  ptr_off = (uint32_t)(b->len - unit_len_pos);
-  buf_uleb(b, 4);
-  buf_u8(b, 8); // pointer byte size
+  for (int f = 0; f < nfix; f++) memcpy(b->p + fix[f].pos, &toff[fix[f].target], 4);
+  free(fix);
 
   for (int i = 0; i < nsyms; i++) {
     if (!syms[i].is_func || !syms[i].addr) continue;
-    buf_uleb(b, 2); // subprogram
+    buf_uleb(b, A_SUBPROG);
     buf_str(b, syms[i].name ? syms[i].name : "");
     buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr);
     buf_u64(b, (uint64_t)(uintptr_t)syms[i].addr + syms[i].size);
     buf_u8(b, 1); buf_u8(b, SLIMCC_DW_OP_FP); // frame_base = exprloc{DW_OP_regFP}
     buf_u8(b, 1); // external
-    // Child variable DIEs for this function's recorded locals.
     MIR_func_t fn = (MIR_func_t)syms[i].mir_func;
     if (fn != NULL) {
       for (int k = 0; k < dbg_locals.len; k++) {
@@ -894,11 +1234,9 @@ static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
         if (strcmp(d->func, syms[i].name ? syms[i].name : "") != 0) continue;
         int64_t off;
         if (!MIR_reg_frame_offset(fn, d->reg, &off)) continue; // not stack-homed
-        uint32_t tref = d->enc == SLIMCC_DBG_PTR ? ptr_off
-                                                 : base_off[base_type_index(d->enc, d->size)];
-        buf_uleb(b, d->is_param ? 6 : 5);
+        buf_uleb(b, d->is_param ? A_PARAM : A_VAR);
         buf_str(b, d->name);
-        buf_u32(b, tref);
+        buf_u32(b, toff ? toff[d->type] : 0); // all type offsets known now
         // location = DW_OP_fbreg(off), DW_OP_deref: the slot holds the variable's
         // address (the alloca pointer), so dereference to reach the variable.
         Buf e = {0};
@@ -911,8 +1249,10 @@ static void dwarf_info(Buf *b, const slimcc_jitsym *syms, int nsyms,
     buf_u8(b, 0); // end subprogram children
   }
   buf_u8(b, 0); // end of CU children
+  free(toff);
   uint32_t unit_len = (uint32_t)(b->len - after_len);
   memcpy(b->p + unit_len_pos, &unit_len, 4);
+#undef REF
 }
 
 // .debug_line: a DWARF4 line program with one sequence per function. file ids
