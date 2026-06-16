@@ -7,7 +7,7 @@
 #include "codegen-mir.h"
 #include "libslimcc.h"
 #include <setjmp.h>
-#include "mir-dwarf.h"
+#include "mir-debug.h"
 
 //
 // Globals normally defined by main.c. Defaults follow the CLI driver
@@ -584,10 +584,10 @@ void slimcc_shutdown(void) {
 // --- JIT debug symbols (GDB JIT interface) -------------------------------
 //
 // The DWARF/ELF debug object is assembled by MIR's generic emitter
-// (mir-dwarf.h); this file only drives it from slimcc's live types and recorded
+// (mir-debug.h); this file only drives it from slimcc's live types and recorded
 // locals, then hands the finished buffer back to the embedder (e.g. jitc) to
 // register with gdb through the embedder's own __jit_debug_descriptor.  slimcc
-// links only the mir-dwarf builder, not its GDB-JIT half (mir-dwarf-gdb.c), so
+// links only the mir-debug builder, not its GDB-JIT half (mir-debug-gdb.c), so
 // there is no second descriptor to clash with the embedder's.
 
 static int debug_obj_fail(char **errmsg, const char *msg) {
@@ -616,27 +616,27 @@ int slimcc_debug_intern_file(const char *name) {
   return dbg_files.len;
 }
 
-// The interned C type graph is built into one persistent mir-dwarf object as
+// The interned C type graph is built into one persistent mir-debug object as
 // the compiler records locals (types carry no addresses, so they can be built
 // during compilation, before MIR_gen); slimcc_debug_obj later adds the function
 // symbols + line programs + variable locations and emits.  Created lazily; NULL
 // means there is nothing to debug yet, or the host cannot emit.
-static MIR_dwarf_t slimcc_dbg;
+static MIR_debug_t slimcc_dbg;
 
 typedef struct {
   char *func, *name;
-  MIR_dwarf_type_t type;
+  MIR_debug_type_t type;
   int is_param;
   unsigned reg;
 } DbgLocal;
 static struct { DbgLocal *v; int len, cap; } dbg_locals;
 
-// Per-add_local cycle map (Type* -> mir-dwarf handle): a recursive struct is
+// Per-add_local cycle map (Type* -> mir-debug handle): a recursive struct is
 // registered before its members are interned, so a member pointing back at it
-// resolves to the in-progress handle (mir-dwarf backpatches the ref at emit).
+// resolves to the in-progress handle (mir-debug backpatches the ref at emit).
 // Reset each add_local — Type* identity is only reliable within one variable's
 // type walk (slimcc recycles its type arena between compiles).
-static struct { Type **k; MIR_dwarf_type_t *v; int len, cap; } dbg_visit;
+static struct { Type **k; MIR_debug_type_t *v; int len, cap; } dbg_visit;
 
 static char *dbg_strndup(const char *s, int n) {
   char *r = malloc(n + 1);
@@ -644,31 +644,31 @@ static char *dbg_strndup(const char *s, int n) {
   r[n] = 0;
   return r;
 }
-// A token's text as a freshly malloc'd C string (mir-dwarf copies names it is
+// A token's text as a freshly malloc'd C string (mir-debug copies names it is
 // given, so the caller frees this), or NULL for an absent token.
 static char *dbg_tokname(Token *t) { return t ? dbg_strndup(t->loc, t->len) : NULL; }
 
-static void dbg_visit_add(Type *ty, MIR_dwarf_type_t h) {
+static void dbg_visit_add(Type *ty, MIR_debug_type_t h) {
   if (dbg_visit.len == dbg_visit.cap) {
     dbg_visit.cap = dbg_visit.cap ? dbg_visit.cap * 2 : 16;
     dbg_visit.k = realloc(dbg_visit.k, dbg_visit.cap * sizeof(Type *));
-    dbg_visit.v = realloc(dbg_visit.v, dbg_visit.cap * sizeof(MIR_dwarf_type_t));
+    dbg_visit.v = realloc(dbg_visit.v, dbg_visit.cap * sizeof(MIR_debug_type_t));
   }
   dbg_visit.k[dbg_visit.len] = ty;
   dbg_visit.v[dbg_visit.len] = h;
   dbg_visit.len++;
 }
 
-static MIR_dwarf_type_t intern_base(Type *ty, MIR_dwarf_encoding_t enc, const char *name) {
-  MIR_dwarf_type_t h = MIR_dwarf_base_type(slimcc_dbg, name, enc, ty->size);
+static MIR_debug_type_t intern_base(Type *ty, MIR_debug_encoding_t enc, const char *name) {
+  MIR_debug_type_t h = MIR_debug_base_type(slimcc_dbg, name, enc, ty->size);
   dbg_visit_add(ty, h);
   return h;
 }
 
 // Build (interning recursive aggregates via dbg_visit so cycles terminate) the
-// mir-dwarf type describing slimcc Type *ty; returns 0 (== void) for unmodeled
+// mir-debug type describing slimcc Type *ty; returns 0 (== void) for unmodeled
 // kinds.
-static MIR_dwarf_type_t intern_type(Type *ty) {
+static MIR_debug_type_t intern_type(Type *ty) {
   if (ty == NULL || ty->kind == TY_VOID) return 0; // 0 == void
   for (int i = 0; i < dbg_visit.len; i++)
     if (dbg_visit.k[i] == ty) return dbg_visit.v[i];
@@ -677,87 +677,87 @@ static MIR_dwarf_type_t intern_type(Type *ty) {
   // list; emit a real enumeration_type so a debugger shows enumerator names.
   if (ty->enums != NULL && ty->kind != TY_ENUM) {
     char *tag = dbg_tokname(ty->tag);
-    MIR_dwarf_type_t h = MIR_dwarf_enum_type(slimcc_dbg, tag ? tag : "", ty->size);
+    MIR_debug_type_t h = MIR_debug_enum_type(slimcc_dbg, tag ? tag : "", ty->size);
     free(tag);
     dbg_visit_add(ty, h);
     for (EnumVal *e = ty->enums; e; e = e->next) {
       char *nm = dbg_tokname(e->name);
-      MIR_dwarf_add_enumerator(slimcc_dbg, h, nm ? nm : "", e->val);
+      MIR_debug_add_enumerator(slimcc_dbg, h, nm ? nm : "", e->val);
       free(nm);
     }
     return h;
   }
 
   switch (ty->kind) {
-  case TY_BOOL: return intern_base(ty, MIR_DWARF_ENC_BOOL, "_Bool");
-  case TY_FLOAT: return intern_base(ty, MIR_DWARF_ENC_FLOAT, "float");
-  case TY_DOUBLE: return intern_base(ty, MIR_DWARF_ENC_FLOAT, "double");
-  case TY_LDOUBLE: return intern_base(ty, MIR_DWARF_ENC_FLOAT, "long double");
+  case TY_BOOL: return intern_base(ty, MIR_DEBUG_ENC_BOOL, "_Bool");
+  case TY_FLOAT: return intern_base(ty, MIR_DEBUG_ENC_FLOAT, "float");
+  case TY_DOUBLE: return intern_base(ty, MIR_DEBUG_ENC_FLOAT, "double");
+  case TY_LDOUBLE: return intern_base(ty, MIR_DEBUG_ENC_FLOAT, "long double");
   case TY_PCHAR: case TY_CHAR:
-    return intern_base(ty, ty->is_unsigned ? MIR_DWARF_ENC_UNSIGNED_CHAR : MIR_DWARF_ENC_SIGNED_CHAR,
+    return intern_base(ty, ty->is_unsigned ? MIR_DEBUG_ENC_UNSIGNED_CHAR : MIR_DEBUG_ENC_SIGNED_CHAR,
                        ty->is_unsigned ? "unsigned char" : "char");
   case TY_SHORT:
-    return intern_base(ty, ty->is_unsigned ? MIR_DWARF_ENC_UNSIGNED : MIR_DWARF_ENC_SIGNED,
+    return intern_base(ty, ty->is_unsigned ? MIR_DEBUG_ENC_UNSIGNED : MIR_DEBUG_ENC_SIGNED,
                        ty->is_unsigned ? "unsigned short" : "short");
   case TY_INT:
-    return intern_base(ty, ty->is_unsigned ? MIR_DWARF_ENC_UNSIGNED : MIR_DWARF_ENC_SIGNED,
+    return intern_base(ty, ty->is_unsigned ? MIR_DEBUG_ENC_UNSIGNED : MIR_DEBUG_ENC_SIGNED,
                        ty->is_unsigned ? "unsigned int" : "int");
   case TY_LONG:
-    return intern_base(ty, ty->is_unsigned ? MIR_DWARF_ENC_UNSIGNED : MIR_DWARF_ENC_SIGNED,
+    return intern_base(ty, ty->is_unsigned ? MIR_DEBUG_ENC_UNSIGNED : MIR_DEBUG_ENC_SIGNED,
                        ty->is_unsigned ? "unsigned long" : "long");
   case TY_LONGLONG:
-    return intern_base(ty, ty->is_unsigned ? MIR_DWARF_ENC_UNSIGNED : MIR_DWARF_ENC_SIGNED,
+    return intern_base(ty, ty->is_unsigned ? MIR_DEBUG_ENC_UNSIGNED : MIR_DEBUG_ENC_SIGNED,
                        ty->is_unsigned ? "unsigned long long" : "long long");
   case TY_BITINT:
-    return intern_base(ty, ty->is_unsigned ? MIR_DWARF_ENC_UNSIGNED : MIR_DWARF_ENC_SIGNED, "_BitInt");
+    return intern_base(ty, ty->is_unsigned ? MIR_DEBUG_ENC_UNSIGNED : MIR_DEBUG_ENC_SIGNED, "_BitInt");
   case TY_PTR: case TY_NULLPTR: {
-    MIR_dwarf_type_t base = intern_type(ty->base); // recursive aggregates resolve via dbg_visit
-    MIR_dwarf_type_t h = MIR_dwarf_pointer_type(slimcc_dbg, base);
+    MIR_debug_type_t base = intern_type(ty->base); // recursive aggregates resolve via dbg_visit
+    MIR_debug_type_t h = MIR_debug_pointer_type(slimcc_dbg, base);
     dbg_visit_add(ty, h);
     return h;
   }
   case TY_ARRAY: {
-    MIR_dwarf_type_t el = intern_type(ty->base);
-    MIR_dwarf_type_t h = MIR_dwarf_array_type(slimcc_dbg, el, ty->array_len); // <0 => unbounded
+    MIR_debug_type_t el = intern_type(ty->base);
+    MIR_debug_type_t h = MIR_debug_array_type(slimcc_dbg, el, ty->array_len); // <0 => unbounded
     dbg_visit_add(ty, h);
     return h;
   }
   case TY_STRUCT: case TY_UNION: {
     char *tag = dbg_tokname(ty->tag);
-    MIR_dwarf_type_t h = MIR_dwarf_struct_type(slimcc_dbg, tag ? tag : "", ty->size,
+    MIR_debug_type_t h = MIR_debug_struct_type(slimcc_dbg, tag ? tag : "", ty->size,
                                                ty->kind == TY_UNION);
     free(tag);
     dbg_visit_add(ty, h); // register before members so recursive refs resolve
     for (Member *m = ty->members; m; m = m->next) {
-      MIR_dwarf_type_t mt = intern_type(m->ty);
+      MIR_debug_type_t mt = intern_type(m->ty);
       char *nm = dbg_tokname(m->name);
       if (m->is_bitfield)
-        MIR_dwarf_add_bitfield(slimcc_dbg, h, nm ? nm : "", mt,
+        MIR_debug_add_bitfield(slimcc_dbg, h, nm ? nm : "", mt,
                                (int64_t)m->offset * 8 + m->bit_offset, m->bit_width);
       else
-        MIR_dwarf_add_member(slimcc_dbg, h, nm ? nm : "", mt, m->offset);
+        MIR_debug_add_member(slimcc_dbg, h, nm ? nm : "", mt, m->offset);
       free(nm);
     }
     return h;
   }
   case TY_ENUM: {
     char *tag = dbg_tokname(ty->tag);
-    MIR_dwarf_type_t h = MIR_dwarf_enum_type(slimcc_dbg, tag ? tag : "", ty->size);
+    MIR_debug_type_t h = MIR_debug_enum_type(slimcc_dbg, tag ? tag : "", ty->size);
     free(tag);
     dbg_visit_add(ty, h);
     for (EnumVal *e = ty->enums; e; e = e->next) {
       char *nm = dbg_tokname(e->name);
-      MIR_dwarf_add_enumerator(slimcc_dbg, h, nm ? nm : "", e->val);
+      MIR_debug_add_enumerator(slimcc_dbg, h, nm ? nm : "", e->val);
       free(nm);
     }
     return h;
   }
   case TY_FUNC: {
-    MIR_dwarf_type_t ret = intern_type(ty->return_ty);
-    MIR_dwarf_type_t h = MIR_dwarf_func_type(slimcc_dbg, ret);
+    MIR_debug_type_t ret = intern_type(ty->return_ty);
+    MIR_debug_type_t h = MIR_debug_func_type(slimcc_dbg, ret);
     dbg_visit_add(ty, h);
     for (Obj *p = ty->param_list; p; p = p->param_next)
-      MIR_dwarf_add_param_type(slimcc_dbg, h, intern_type(p->ty));
+      MIR_debug_add_param_type(slimcc_dbg, h, intern_type(p->ty));
     return h;
   }
   default: // VLA, auto, asm, ... -> describe as void
@@ -769,9 +769,9 @@ void slimcc_debug_add_local(const char *func, const char *name, Type *ty,
                             int is_param, unsigned reg) {
   for (int i = 0; i < dbg_locals.len; i++) // dedup param-vs-scope double listing
     if (dbg_locals.v[i].reg == reg && strcmp(dbg_locals.v[i].func, func) == 0) return;
-  if (slimcc_dbg == NULL && (slimcc_dbg = MIR_dwarf_init()) == NULL) return; // unsupported host
+  if (slimcc_dbg == NULL && (slimcc_dbg = MIR_debug_init()) == NULL) return; // unsupported host
   dbg_visit.len = 0;
-  MIR_dwarf_type_t type = intern_type(ty);
+  MIR_debug_type_t type = intern_type(ty);
   if (dbg_locals.len == dbg_locals.cap) {
     dbg_locals.cap = dbg_locals.cap ? dbg_locals.cap * 2 : 16;
     dbg_locals.v = realloc(dbg_locals.v, dbg_locals.cap * sizeof(DbgLocal));
@@ -799,7 +799,7 @@ void slimcc_debug_reset(void) {
   dbg_visit.v = NULL;
   dbg_visit.len = dbg_visit.cap = 0;
   if (slimcc_dbg) {
-    MIR_dwarf_destroy(slimcc_dbg);
+    MIR_debug_destroy(slimcc_dbg);
     slimcc_dbg = NULL;
   }
 }
@@ -814,18 +814,18 @@ int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
   // The persistent object holds the interned types (built as locals were
   // recorded); create it now if no locals were recorded, so we can still emit
   // function symbols + the line program.
-  if (slimcc_dbg == NULL && (slimcc_dbg = MIR_dwarf_init()) == NULL)
+  if (slimcc_dbg == NULL && (slimcc_dbg = MIR_debug_init()) == NULL)
     return debug_obj_fail(errmsg, "slimcc_debug_obj: unsupported host architecture");
 
   // File table (1-based ids matching what codegen stamped onto the line maps).
-  for (int i = 0; i < dbg_files.len; i++) MIR_dwarf_add_file(slimcc_dbg, dbg_files.names[i]);
+  for (int i = 0; i < dbg_files.len; i++) MIR_debug_add_file(slimcc_dbg, dbg_files.names[i]);
 
   // One subprogram per function, with its recorded locals.  slimcc ALLOCAs every
   // local, so the reg's frame slot holds the variable's *address*: deref_p=1,
   // and no member offset.
   for (int i = 0; i < nsyms; i++) {
     if (!syms[i].is_func || !syms[i].addr) continue;
-    MIR_dwarf_add_func(slimcc_dbg, syms[i].name ? syms[i].name : "", syms[i].addr,
+    MIR_debug_add_func(slimcc_dbg, syms[i].name ? syms[i].name : "", syms[i].addr,
                        syms[i].size, syms[i].line_map, syms[i].line_map_len);
     MIR_func_t fn = (MIR_func_t)syms[i].mir_func;
     if (fn == NULL) continue;
@@ -834,12 +834,12 @@ int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
       int64_t off;
       if (strcmp(d->func, syms[i].name ? syms[i].name : "") != 0) continue;
       if (!MIR_reg_frame_offset(fn, d->reg, &off)) continue; // not stack-homed
-      MIR_dwarf_add_var(slimcc_dbg, d->name, d->is_param, d->type, off, /*deref_p=*/1,
+      MIR_debug_add_var(slimcc_dbg, d->name, d->is_param, d->type, off, /*deref_p=*/1,
                         /*member_offset=*/0);
     }
   }
 
-  if (MIR_dwarf_emit(slimcc_dbg, buf, size) != 0)
+  if (MIR_debug_emit(slimcc_dbg, buf, size) != 0)
     return debug_obj_fail(errmsg, "slimcc_debug_obj: could not build the debug object");
   return 0;
 }
