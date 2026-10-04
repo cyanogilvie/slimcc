@@ -716,9 +716,19 @@ static MIR_reg_t gen_binop(NodeKind kind, Type *ty, MIR_reg_t lhs, MIR_reg_t rhs
   return r;
 }
 
+// libc routines the backend calls on its own (block zero/copy) share the
+// symbol table with user references: a TU that also declares or calls the
+// same name must resolve to one item, not a forward plus a clashing import.
+static MIR_item_t libc_item(const char *name) {
+  SymItem *si = sym_entry(name);
+  if (!si->item)
+    si->item = MIR_new_forward(mc, si->key);
+  return si->item;
+}
+
 static MIR_item_t get_memset(void) {
   if (!memset_import) {
-    memset_import = MIR_new_import(mc, "memset");
+    memset_import = libc_item("memset");
     MIR_var_t vars[3] = {
       {MIR_T_P, "s", 0}, {MIR_T_I64, "c", 0}, {MIR_T_I64, "n", 0}};
     MIR_type_t res = MIR_T_P;
@@ -729,7 +739,7 @@ static MIR_item_t get_memset(void) {
 
 static MIR_item_t get_memcpy(void) {
   if (!memcpy_import) {
-    memcpy_import = MIR_new_import(mc, "memcpy");
+    memcpy_import = libc_item("memcpy");
     MIR_var_t vars[3] = {
       {MIR_T_P, "d", 0}, {MIR_T_P, "s", 0}, {MIR_T_I64, "n", 0}};
     MIR_type_t res = MIR_T_P;
