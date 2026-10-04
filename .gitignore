@@ -16,3 +16,4 @@
 /libslimcc-headers.inc
 /build*
 /subprojects/mir
+/subprojects/.wraplock
