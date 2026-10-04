@@ -2,6 +2,7 @@
 
 ## Contents
 - Parser/backend contract facts
+- Register promotion of locals
 - _BitInt design
 - wchar_t mechanism
 - Over-aligned globals
@@ -23,6 +24,16 @@
 - **Zero-sized objects are real**: `struct {}`/`T[0]` have size 0. Locals still get a ≥1-byte slot (`alloca_obj`'s `MAX(size,1)`), `gen_mem_zero`/`gen_mem_copy` early-out on `size <= 0`, and zero-size by-value args/params ride MIR BLK of size 0 fine (named + variadic validated). `return expr;` carries no value when the function returns void **or** the expr has size ≤0 — evaluate for side effects then `ret` with no operand. (`ty_void->size` is 1, so test `rt->kind == TY_VOID`, not size.)
 - `prepare_funcall` may be asked (via `scope->has_alloca`) to build `node->call.alloca_args` so x86 can evaluate `alloca()`-containing args before pushing stack args. The MIR backend no-ops it: MIR evaluates every arg into a register before the CALL insn, so there is no interleaving hazard.
 - Incomplete type kinds `TY_ENUM_INCMP`/`TY_FUNC_INCMP`/`TY_ARRAY_INCMP` exist; a *complete* enum is just its underlying integer kind with `ty->enums` set (no `TY_ENUM`).
+
+## Register promotion of locals
+
+Scalar locals whose address is never taken live in a MIR register (`var->ptr == mir_regval_marker`, register in `var->ofs`) instead of an ALLOCA slot (`mir_local_marker`) — MIR's generator does not promote alloca slots itself, so without this every local costs a load/store per access. `promote_local` decides per Obj after `scan_node` walks the body marking `Obj.addr_taken`:
+- **The scan must mirror `gen_addr`'s recursion, not just look for `&var`.** `scan_lvalue` marks every variable `gen_addr` would take the address of: `ND_ADDR` operands, non-`ND_VAR` lhs of `ND_ASSIGN`/`ND_ARITH_ASSIGN`/`ND_POST_INCDEC`, `ND_MEMBER` bases, and the rhs of `ND_CHAIN`/`ND_COMMA` in those positions (compound literals arrive as `ND_CHAIN(init, ND_VAR tmp)`, so `&(int){5}` / `(int){5}++` have no direct `ND_ADDR(ND_VAR)`). `ND_INIT_SEQ` targets are marked too (zero-filled through their address). Defer chains (cleanup handlers take `&var` implicitly) are scanned via each node's `dfr_from..dfr_dest`.
+- **Fail-safe:** `gen_addr` on a promoted local is `internal_error()` — a scan gap becomes a clean compile error, never a miscompile. Any node kind the scan doesn't know sets `no_promote` for the whole function; add new AST kinds to `scan_node` when the backend learns them.
+- Disabled per function for `opt_g` (DWARF needs stable frame slots) and `dont_reuse_stk` (a `returns_twice` callee such as setjmp: register values don't survive longjmp). Never promoted: aggregates/VLAs/big `_BitInt` (`is_addr_value`), `volatile`/`_Atomic`, static locals.
+- Writes go through `set_regval`, which canonicalizes exactly as a memory load would (narrow ints extended, small `_BitInt` normalized), so reads can return the register verbatim. `x++` snapshots the old value into a fresh register before the write.
+- A VLA's `vptr` is an ordinary promotable local: use `get_local`/`set_local` (register-or-slot) for it, never `local_addr`.
+- Validated by jitc's `tests/promotion.test` (IR shape: no `alloca`/memory operands for promoted scalars; runtime: compound-assign, inc/dec, narrow ints, floats, mixed address-taken).
 
 ## _BitInt design
 

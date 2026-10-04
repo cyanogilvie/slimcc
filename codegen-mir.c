@@ -58,6 +58,8 @@ typedef enum {
 
 static void gen_mem_copy(MIR_reg_t dst, MIR_reg_t src, int64_t size);
 static bool is_big_bitint(Type *ty);
+static bool is_addr_value(Type *ty);
+static bool promote_local(Obj *var);
 static MIR_reg_t bitint_buf(int64_t size);
 static MIR_reg_t bitint_copy(Type *ty, MIR_reg_t src);
 static MIR_reg_t bitint_norm(MIR_reg_t r, Type *ty);
@@ -222,13 +224,32 @@ static MIR_label_t get_label(const char *fmt, ...) {
 // set to this marker so misuse is caught.
 static const char mir_local_marker[] = "<mir-local>";
 
+// A register-promoted local holds its *value* (not its address) directly in a
+// MIR virtual register stashed in var->ofs. Scalars whose address is never
+// taken qualify; MIR's register allocator then keeps them in registers instead
+// of generating the stack traffic the memory model would (see promote_local).
+static const char mir_regval_marker[] = "<mir-regval>";
+
+// Set while emitting one function when register promotion must be disabled for
+// the whole function (e.g. an unhandled node kind in the address-taken scan, or
+// debug mode). Conservative: leaves every local in memory, as before.
+static bool no_promote;
+
 static int32_t obj_align(Obj *var) {
   return var->alt_align ? var->alt_align : var->ty->align;
 }
 
 static void alloca_obj(Obj *var) {
+  // Address never taken and scalar: keep the value in a MIR register and skip
+  // the stack slot entirely. Reads return the register; writes move into it.
+  if (promote_local(var)) {
+    var->ofs = (int)new_tmp(mir_class(var->ty));
+    var->ptr = mir_regval_marker;
+    return;
+  }
+
   // VLAs are not scope locals: each is an OBJ_INDIR Obj whose vptr (an
-  // ordinary pointer-sized local) holds the runtime allocation.
+  // ordinary pointer-sized local, itself promotable) holds the allocation.
   int64_t size = var->ty->size;
   if (size < 0)
     error("variable '%s' has incomplete type", var->name ? var->name : "");
@@ -276,6 +297,187 @@ static MIR_reg_t local_addr(Obj *var) {
   if (var->ptr != mir_local_marker)
     internal_error();
   return (MIR_reg_t)var->ofs;
+}
+
+// A register-promoted local: its value lives directly in a MIR register.
+static bool is_reg_local(Obj *var) {
+  return var->ptr == mir_regval_marker;
+}
+
+static MIR_reg_t regval(Obj *var) {
+  if (var->ptr != mir_regval_marker)
+    internal_error();
+  return (MIR_reg_t)var->ofs;
+}
+
+//
+// Address-taken analysis for register promotion. A scalar local can live in a
+// MIR register only if its address is never materialized. Every site that
+// takes a local's address - the `&` operator and the implicit `&var` the parser
+// synthesizes for cleanup handlers, atomic CAS/exchange, etc. - builds an
+// ND_ADDR whose operand is an ND_VAR, so marking those operands is sufficient.
+// The scan mirrors gen_stmt/gen_expr/gen_addr's child traversal exactly; any
+// node kind they don't handle trips no_promote (codegen would error on it
+// anyway), keeping the analysis conservative if the AST ever grows a new kind.
+//
+
+static void scan_node(Node *node);
+
+// An operand whose address gen_addr computes. Follows gen_addr's own
+// recursion: every variable it would take the address of (directly, or
+// through a comma/chain - e.g. a compound literal `&(int){5}` - or a member
+// base) is marked; anything gen_addr evaluates as a value is scanned normally.
+static void scan_lvalue(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+    node->m.var->addr_taken = true;
+    return;
+  case ND_MEMBER:
+    scan_lvalue(node->m.lhs);
+    return;
+  case ND_CHAIN:
+  case ND_COMMA:
+    scan_node(node->m.lhs);
+    scan_lvalue(node->m.rhs);
+    return;
+  default:
+    scan_node(node);
+    return;
+  }
+}
+
+static void scan_list(Node *head) {
+  for (Node *n = head; n; n = n->next)
+    scan_node(n);
+}
+
+static void scan_defers(DeferStmt *from, DeferStmt *end) {
+  for (DeferStmt *d = from; d && d != end; d = d->next) {
+    if (d->cleanup_fn)
+      scan_node(d->cleanup_fn);
+    if (d->stmt)
+      scan_node(d->stmt);
+  }
+}
+
+static void scan_node(Node *node) {
+  if (!node)
+    return;
+  if (node->dfr_from != node->dfr_dest)
+    scan_defers(node->dfr_from, node->dfr_dest);
+
+  switch (node->kind) {
+  case ND_ADDR:
+    scan_lvalue(node->m.lhs);
+    return;
+
+  // Lvalue operands go through gen_addr unless they are a plain variable,
+  // which the register paths in gen_expr/gen_arith_assign handle directly.
+  case ND_ASSIGN: case ND_ARITH_ASSIGN: case ND_POST_INCDEC:
+    if (node->m.lhs->kind == ND_VAR)
+      scan_node(node->m.lhs);
+    else
+      scan_lvalue(node->m.lhs);
+    scan_node(node->m.rhs);
+    return;
+  case ND_MEMBER:
+    scan_lvalue(node->m.lhs);
+    return;
+
+  // Single-operand (m.lhs) nodes.
+  case ND_POS: case ND_NEG: case ND_BITNOT: case ND_NOT:
+  case ND_DEREF: case ND_CAST:
+  case ND_EXPR_STMT: case ND_GOTO_EXPR: case ND_RETURN:
+  case ND_VA_START: case ND_VA_ARG:
+  case ND_ALLOCA: case ND_ALLOCA_ZINIT:
+    scan_node(node->m.lhs);
+    return;
+
+  // Two-operand (m.lhs, m.rhs) nodes.
+  case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_REM:
+  case ND_BITAND: case ND_BITOR: case ND_BITXOR:
+  case ND_SHL: case ND_SHR: case ND_SAR:
+  case ND_EQ: case ND_NE: case ND_LT: case ND_LE: case ND_GT: case ND_GE:
+  case ND_LOGAND: case ND_LOGOR:
+  case ND_CHAIN: case ND_COMMA: case ND_EXCH: case ND_VA_COPY:
+    scan_node(node->m.lhs);
+    scan_node(node->m.rhs);
+    return;
+
+  case ND_CKD_ARITH:
+    scan_node(node->m.lhs);
+    scan_node(node->m.rhs);
+    scan_node(node->m.target);
+    return;
+
+  case ND_COND: case ND_IF:
+    scan_node(node->ctrl.cond);
+    scan_node(node->ctrl.then);
+    scan_node(node->ctrl.els);
+    return;
+  case ND_FOR:
+    scan_node(node->ctrl.for_init);
+    scan_node(node->ctrl.cond);
+    scan_node(node->ctrl.then);
+    scan_node(node->ctrl.for_inc);
+    return;
+  case ND_DO: case ND_SWITCH:
+    scan_node(node->ctrl.cond);
+    scan_node(node->ctrl.then);
+    return;
+
+  case ND_BLOCK: case ND_STMT_EXPR:
+    scan_list(node->blk.body);
+    return;
+  case ND_INIT_SEQ:
+    // The object is zeroed and filled through its address (local_addr); keep it
+    // in memory. Aggregates already stay in memory, but a brace-initialized
+    // scalar (`int x = {5}`) would otherwise be promotable.
+    node->m.var->addr_taken = true;
+    scan_list(node->m.lhs);
+    return;
+
+  case ND_FUNCALL:
+    scan_node(node->call.expr);
+    for (Obj *arg = node->call.args; arg; arg = arg->param_next)
+      scan_node(arg->arg_expr);
+    return;
+  case ND_CAS:
+    scan_node(node->cas.addr);
+    scan_node(node->cas.old_val);
+    scan_node(node->cas.new_val);
+    return;
+
+  // Leaves: nothing to descend into.
+  case ND_NUM: case ND_VAR: case ND_NULL_EXPR: case ND_NULL_STMT:
+  case ND_UNREACHABLE: case ND_LABEL_VAL: case ND_LABEL:
+  case ND_GOTO: case ND_BREAK: case ND_CONT:
+  case ND_CASE: case ND_DEFAULT: case ND_THREAD_FENCE:
+    return;
+
+  default:
+    // A kind the backend's gen functions don't handle either: be safe and
+    // disable promotion for the whole function rather than risk missing an
+    // address-taking operand.
+    no_promote = true;
+    return;
+  }
+}
+
+// Whether a local should hold its value in a MIR register instead of a stack
+// slot: a non-volatile, non-atomic scalar whose address is never taken. VLAs,
+// aggregates and big _BitInts are represented by their address and stay in
+// memory; function-static locals are globals.
+static bool promote_local(Obj *var) {
+  if (no_promote || var->addr_taken)
+    return false;
+  if (var->kind != OBJ_LOCAL || var->is_static_lvar)
+    return false;
+  if (is_addr_value(var->ty))
+    return false;
+  if (var->ty->qual & (Q_VOLATILE | Q_ATOMIC))
+    return false;
+  return true;
 }
 
 //
@@ -463,6 +665,41 @@ static MIR_reg_t int_extend(MIR_reg_t src, Type *ty) {
   return r;
 }
 
+// Move val into a register-promoted local, canonicalized to the local's type
+// (the same in-register representation gen_cast2 and a memory load produce, so
+// reads can return the register verbatim). Returns the register, which is the
+// value of the enclosing assignment expression.
+static MIR_reg_t set_regval(Obj *var, MIR_reg_t val) {
+  Type *ty = var->ty;
+  MIR_reg_t dst = regval(var);
+  if (is_scalar_fp(ty)) {
+    MIR_insn_code_t mov = ty->kind == TY_FLOAT    ? MIR_FMOV
+                          : ty->kind == TY_DOUBLE ? MIR_DMOV
+                                                  : MIR_LDMOV;
+    out(MIR_new_insn(mc, mov, rop(dst), rop(val)));
+    return dst;
+  }
+  MIR_reg_t canon = val;
+  if (ty->kind == TY_BITINT && ty->bit_cnt != ty->size * 8)
+    canon = bitint_norm(val, ty);
+  else if (is_integer(ty) && ty->size < 8)
+    canon = int_extend(val, ty);
+  out(MIR_new_insn(mc, MIR_MOV, rop(dst), rop(canon)));
+  return dst;
+}
+
+// Read / write a scalar local wherever it lives (register or stack slot).
+static MIR_reg_t get_local(Obj *var) {
+  return is_reg_local(var) ? regval(var) : load_scalar(var->ty, local_addr(var), 0);
+}
+
+static void set_local(Obj *var, MIR_reg_t val) {
+  if (is_reg_local(var))
+    set_regval(var, val);
+  else
+    store_scalar(var->ty, local_addr(var), 0, val);
+}
+
 static MIR_reg_t gen_cast2(MIR_reg_t src, Type *from, Type *to, Token *tok) {
   if (to->kind == TY_VOID)
     return src;
@@ -613,7 +850,7 @@ static void gen_defr(Node *node) {
       }
 
       Obj *vla = defr->next ? defr->next->vla : NULL;
-      MIR_reg_t pos = load_scalar(ty_long, vla ? local_addr(vla) : vla_base_slot, 0);
+      MIR_reg_t pos = vla ? get_local(vla) : load_scalar(ty_long, vla_base_slot, 0);
       out(MIR_new_insn(mc, MIR_BEND, rop(pos)));
       defr = defr->next;
       continue;
@@ -1210,11 +1447,16 @@ static MIR_reg_t gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
     Obj *var = node->m.var;
-    // A VLA variable's vptr slot holds the pointer to its allocation.
+    // A VLA variable's vptr holds the pointer to its allocation.
     if (var->kind == OBJ_INDIR)
-      return load_scalar(ty_long, local_addr(var->vptr), 0);
-    if (var->kind == OBJ_LOCAL && !var->is_static_lvar)
+      return get_local(var->vptr);
+    if (var->kind == OBJ_LOCAL && !var->is_static_lvar) {
+      // A register-promoted local has no address; the address-taken scan
+      // guarantees gen_addr is never reached for one.
+      if (is_reg_local(var))
+        internal_error();
       return local_addr(var);
+    }
     // Thread-local: resolve the per-thread copy through the emutls runtime
     // (native TLS needs dynamic-linker cooperation that JIT-loaded modules
     // cannot get). The runtime honors the control object's alignment, so
@@ -1306,14 +1548,35 @@ static MIR_reg_t gen_arith_assign(Node *node, bool want_old) {
   // Mirrors codegen.c's gen_expr_null_lhs: a synthetic expression with an
   // ND_NULL_EXPR lhs lets add_type insert the conversion casts.
   Node *lhs = node->m.lhs;
-  MIR_reg_t addr = gen_addr(lhs);
-  MIR_reg_t old = load_node(lhs, addr);
+  bool reg_lhs = lhs->kind == ND_VAR && is_reg_local(lhs->m.var);
 
-  // A plain big-bitint lvalue's "value" is its storage address; the
-  // postfix result must be a snapshot taken before the store.
+  // For a register-promoted local, read/write the register directly; otherwise
+  // take the address once and load through it.
+  MIR_reg_t addr = 0;
+  MIR_reg_t old;
+  if (reg_lhs) {
+    old = regval(lhs->m.var);
+  } else {
+    addr = gen_addr(lhs);
+    old = load_node(lhs, addr);
+  }
+
+  // The postfix result must be a snapshot taken before the store. A plain
+  // big-bitint lvalue's "value" is its storage address (copied above); a
+  // register value is captured into a fresh register so the store doesn't
+  // clobber it.
   if (want_old && is_big_bitint(lhs->ty) &&
       !(lhs->kind == ND_MEMBER && lhs->m.member->is_bitfield))
     old = bitint_copy(lhs->ty, old);
+  else if (want_old && reg_lhs) {
+    MIR_reg_t snap = new_tmp(mir_class(lhs->ty));
+    out(MIR_new_insn(mc, mir_class(lhs->ty) == MIR_T_F    ? MIR_FMOV
+                         : mir_class(lhs->ty) == MIR_T_D  ? MIR_DMOV
+                         : mir_class(lhs->ty) == MIR_T_LD ? MIR_LDMOV
+                                                          : MIR_MOV,
+                     rop(snap), rop(old)));
+    old = snap;
+  }
 
   NodeKind kind = node->kind == ND_POST_INCDEC ? ND_ADD : node->arith_kind;
   Node null = {.kind = ND_NULL_EXPR, .ty = lhs->ty, .tok = node->tok};
@@ -1325,7 +1588,10 @@ static MIR_reg_t gen_arith_assign(Node *node, bool want_old) {
   MIR_reg_t res = gen_expr(new_cast(&expr, lhs->ty));
   null_expr_reg = saved;
 
-  res = gen_store(lhs, addr, res);
+  if (reg_lhs)
+    res = set_regval(lhs->m.var, res);
+  else
+    res = gen_store(lhs, addr, res);
   return want_old ? old : res;
 }
 
@@ -1391,6 +1657,10 @@ static MIR_reg_t gen_expr(Node *node) {
     return bitint_norm(r, node->ty);
   }
   case ND_VAR:
+    // A register-promoted local's value is the register itself, kept canonical.
+    if (is_reg_local(node->m.var))
+      return regval(node->m.var);
+    return load_node(node, gen_addr(node));
   case ND_MEMBER:
     return load_node(node, gen_addr(node));
   case ND_DEREF:
@@ -1401,6 +1671,8 @@ static MIR_reg_t gen_expr(Node *node) {
     // Plain assignment to _Atomic lvalues is an ordinary store, like
     // codegen.c (atomic read-modify-write is lowered to CAS loops by the
     // parser and arrives as ND_CAS).
+    if (node->m.lhs->kind == ND_VAR && is_reg_local(node->m.lhs->m.var))
+      return set_regval(node->m.lhs->m.var, gen_expr(node->m.rhs));
     MIR_reg_t addr = gen_addr(node->m.lhs);
     MIR_reg_t val = gen_expr(node->m.rhs);
     return gen_store(node->m.lhs, addr, val);
@@ -1546,9 +1818,9 @@ static MIR_reg_t gen_expr(Node *node) {
                                         MIR_new_ref_op(mc, ms), rop(res), rop(r), iop(0),
                                         rop(sz)}));
     }
-    // A VLA declaration stores the allocation into the variable's vptr slot.
+    // A VLA declaration stores the allocation into the variable's vptr.
     if (node->m.var)
-      store_scalar(ty_long, local_addr(node->m.var->vptr), 0, r);
+      set_local(node->m.var->vptr, r);
     return r;
   }
   case ND_LABEL_VAL: {
@@ -2050,9 +2322,19 @@ void emit_text(Obj *fn) {
     MIR_set_source_loc(mc, slimcc_debug_intern_file(fn->body->tok->file->name),
                        fn->body->tok->line_no);
 
+  // Decide register promotion before laying out slots. Disabled wholesale for
+  // debug builds (so every local keeps a stable frame slot DWARF can name) and
+  // for functions that call setjmp-like callees (dont_reuse_stk), whose locals
+  // must survive in memory across a longjmp. Otherwise the address-taken scan
+  // marks which locals must stay in memory.
+  no_promote = opt_g || fn->dont_reuse_stk;
+  if (!no_promote)
+    scan_node(fn->body);
+
   // Slots for all locals (parameters included), then spill the incoming
   // arguments into their slots. A block argument's register holds the
-  // block's address; copy it for by-value semantics.
+  // block's address; copy it for by-value semantics. Promoted locals get a
+  // value register instead of a slot (see alloca_obj).
   alloca_scope(fn->ty->scopes);
 
   // Record the entry stack position for VLA deallocation. This comes
@@ -2071,6 +2353,8 @@ void emit_text(Obj *fn) {
     MIR_reg_t arg = MIR_reg(mc, vars[i].name, fn_func);
     if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION || is_big_bitint(p->ty))
       gen_mem_copy(local_addr(p), arg, p->ty->size);
+    else if (is_reg_local(p))
+      set_regval(p, arg);
     else
       store_scalar(p->ty, local_addr(p), 0, arg);
   }

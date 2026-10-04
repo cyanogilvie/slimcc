@@ -538,6 +538,8 @@ struct Obj {
   // Local variable
   int ofs;
   const char *ptr;
+  bool addr_taken; // MIR backend: address is taken somewhere (or implied), so
+                   // the local cannot be promoted to a MIR register
   Obj *param_next;
   bool pass_by_stack;
   bool is_zero_sized_arg;
