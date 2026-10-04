@@ -19,6 +19,10 @@
 - slimcc emits per-function during parse (isomorphic to `MIR_new_func`…`MIR_finish_func`); there is no whole-program pass.
 - Atomics arrive pre-lowered: parse turns atomic arithmetic into CAS loops; the backend only sees `ND_CAS`/`ND_EXCH`/`ND_THREAD_FENCE`, lowered to calls into `slimcc-mir-helpers.c` (host-compiled with real `__atomic_*`).
 - `defer`, constexpr, `_Generic`, `_Countof` are all parser-side — the backend inherits them for free.
+- **Objects carry an `ObjKind`** (`OBJ_GLOBAL`/`OBJ_TLS`/`OBJ_LOCAL`/`OBJ_INDIR`), not `is_local`/`is_tls`. **A VLA is an `OBJ_INDIR` Obj that is NOT a scope local**: its `vptr` (an ordinary `ptrdiff_t` local in the scope) holds the runtime allocation. `gen_addr` loads through `var->vptr`; the declaration's `ND_ALLOCA` stores into `node->m.var->vptr`; `DF_VLA_DEALLOC`'s `defr->vla` *is* the vptr. `TY_VLA` itself has size/align 0. Consequence for debug info: VLA variables don't appear (the vptr is nameless; they were void-typed before anyway).
+- **Zero-sized objects are real**: `struct {}`/`T[0]` have size 0. Locals still get a ≥1-byte slot (`alloca_obj`'s `MAX(size,1)`), `gen_mem_zero`/`gen_mem_copy` early-out on `size <= 0`, and zero-size by-value args/params ride MIR BLK of size 0 fine (named + variadic validated). `return expr;` carries no value when the function returns void **or** the expr has size ≤0 — evaluate for side effects then `ret` with no operand. (`ty_void->size` is 1, so test `rt->kind == TY_VOID`, not size.)
+- `prepare_funcall` may be asked (via `scope->has_alloca`) to build `node->call.alloca_args` so x86 can evaluate `alloca()`-containing args before pushing stack args. The MIR backend no-ops it: MIR evaluates every arg into a register before the CALL insn, so there is no interleaving hazard.
+- Incomplete type kinds `TY_ENUM_INCMP`/`TY_FUNC_INCMP`/`TY_ARRAY_INCMP` exist; a *complete* enum is just its underlying integer kind with `ty->enums` set (no `TY_ENUM`).
 
 ## _BitInt design
 
@@ -38,6 +42,10 @@ Zero-initialized over-aligned globals: bss over-allocation + address rounding in
 ## Embedded headers / zero-filesystem VFS
 
 `slimcc_headers/include/*` are embedded via the generated `libslimcc-headers.inc` and registered as `"<slimcc>/..."` vfiles, searched first; `get_realpath` passes vfile names through. Result: `slimcc_compile` works with zero filesystem access (verified by `libslimcc-smoke.c`). User vfiles come through `slimcc_options.vfiles`; contents must outlive all compilations.
+
+Several embedded headers are `#include_next` wrappers (`math.h`, `limits.h` for `BITINT_MAXWIDTH`). `#include_next` resumes the search at the include path *after* `<slimcc>`, so an embedder must never also put the on-disk `slimcc_headers/include` on its include path — the wrapper would find its own duplicate (guard already defined → empty) instead of the system header, silently losing e.g. `INT_MAX`/`sqrt`. `mir-run.c` used to do exactly this until 2026-10-04.
+
+Backend-internal libc calls (`memset`/`memcpy` for block zero/copy) are referenced through the shared symbol table (`libc_item`), not a private `MIR_new_import`: a TU that also declares/calls the same name would otherwise produce a forward plus a clashing import ("already defined as import").
 
 ## aarch64 specifics
 
@@ -68,6 +76,8 @@ Zero-initialized over-aligned globals: bss over-allocation + address rounding in
 - `File` structs (`new_file`) are tracked in tokenize.c's `file_pool`, freed in `tokenize_reset` (mirrors `file_contents`).
 - `FuncObj` comes from `cc1_arena`, not malloc (emit_text).
 - `parse_free_scopes()` must run on the error path BEFORE `arenas_off()` — nested Scope structs live in the still-on AST arena, and their `vars`/`tags` bucket arrays are heap (leave_scope only frees them when `fnctx` is set; an error unwind skips it).
+- Static-storage initializer images (`Obj.init_data`, malloc'd by `gvar_initializer`/`constexpr_initializer2`/string+numseq init arrays) are tracked by `alloc_init_data` and freed in `parse_reset` — too large in general for an arena pool (`ARENA_POOL_SIZE` cap). Was a per-initialized-global leak until 2026-10-04; the older harnesses only had uninitialized globals.
+- No function-local `static` may cache an arena/per-compile pointer across compiles: hoist it to file scope and clear it in the matching `*_reset` (e.g. parse.c's `empty_name`, the `__FUNCTION__`-outside-a-function anonymous global — a dangling Obj from the previous compile otherwise). After each upstream rebase, grep the upstream diff for new `static` locals.
 - The vfile registry is cleared in `tokenize_reset` (entries' names are strdup'd); `slimcc_compile` rebuilds it every call, so distinct TU names would otherwise accumulate forever.
 
 The *mixed* harness (persistent consumer context) grows ~35 kB per retained module — live module data kept by design, freed by `MIR_finish` on the consumer context. NOT a leak. (Was ~640 kB before the bitint helpers became host-compiled imports instead of per-module compiled copies.) MIR has no per-module unload — consumers wanting compile/release churn should batch modules into expendable contexts.
