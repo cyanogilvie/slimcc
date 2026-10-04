@@ -823,6 +823,8 @@ int slimcc_debug_obj(const slimcc_jitsym *syms, int nsyms, void **buf,
                        syms[i].size, syms[i].line_map, syms[i].line_map_len);
     MIR_func_t fn = (MIR_func_t)syms[i].mir_func;
     if (fn == NULL) continue;
+    // Frame-unwind info, so a debugger can walk from JIT frames to their callers.
+    if (fn->cfi != NULL) MIR_debug_add_func_frame(slimcc_dbg, fn->cfi, fn->cfi_len);
     for (int k = 0; k < dbg_locals.len; k++) {
       DbgLocal *d = &dbg_locals.v[k];
       int64_t off;
