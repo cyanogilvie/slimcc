@@ -34,6 +34,13 @@ typedef struct slimcc_options {
   FILE *mir_dump; // if set, the textual MIR module is dumped here
   const struct slimcc_pch *pch; // if set, a precompiled preamble (see below)
   int debug; // if non-zero, emit source locations for debug info (see slimcc_debug_obj)
+  // With debug: debug info for optimized code, as with gcc -g -O. Scalar
+  // locals whose address is never taken still live in registers (the
+  // performance-critical register promotion stays on), so a debugger can't
+  // print them; stepping, backtraces and memory-resident locals are unaffected.
+  // Without it, debug keeps every local in a stack slot (pair with
+  // MIR_set_spill_all for full variable inspection at -O0).
+  int debug_optimized;
 } slimcc_options;
 
 // Compile one translation unit from memory. On success returns a finished,

@@ -34,6 +34,7 @@ static int64_t ctrl_cnt;
 
 static HashMap sym_items;  // symbol name -> SymItem (module lifetime)
 static HashMap label_map;  // label key -> MIR_label_t (function lifetime)
+bool codegen_mir_debug_optimized;
 static HashMap reg_names;  // taken "C%name" reg names (function lifetime)
 
 static MIR_item_t memset_import, memcpy_import;
@@ -2354,11 +2355,12 @@ void emit_text(Obj *fn) {
                        fn->body->tok->line_no);
 
   // Decide register promotion before laying out slots. Disabled wholesale for
-  // debug builds (so every local keeps a stable frame slot DWARF can name) and
-  // for functions that call setjmp-like callees (dont_reuse_stk), whose locals
-  // must survive in memory across a longjmp. Otherwise the address-taken scan
-  // marks which locals must stay in memory.
-  no_promote = opt_g || fn->dont_reuse_stk;
+  // debug builds (so every local keeps a stable frame slot DWARF can name)
+  // unless the embedder asked for optimized-code debug info, and for functions
+  // that call setjmp-like callees (dont_reuse_stk), whose locals must survive
+  // in memory across a longjmp. Otherwise the address-taken scan marks which
+  // locals must stay in memory.
+  no_promote = (opt_g && !codegen_mir_debug_optimized) || fn->dont_reuse_stk;
   if (!no_promote)
     scan_node(fn->body);
 

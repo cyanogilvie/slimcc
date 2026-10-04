@@ -20,4 +20,8 @@ void codegen_mir_abort(void);
 // end of each compile (via reset_all) so it is not retained between compiles.
 void codegen_mir_reset(void);
 
+// Set per compile by slimcc_compile from slimcc_options.debug_optimized: under
+// opt_g, keep register promotion of scalar locals on.
+extern bool codegen_mir_debug_optimized;
+
 #endif

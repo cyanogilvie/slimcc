@@ -354,6 +354,7 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   slimcc_vfile_add(name, source);
   register_embedded_headers();
   opt_g = opt && opt->debug; // gate source-location stamping in codegen-mir
+  codegen_mir_debug_optimized = opt_g && opt->debug_optimized;
   if (opt) {
     for (int i = 0; i < opt->n_vfiles; i++)
       slimcc_vfile_add(opt->vfiles[i].name, opt->vfiles[i].contents);
