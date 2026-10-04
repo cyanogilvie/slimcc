@@ -180,6 +180,26 @@ static Obj *globals = &globals_init;
 static Scope *scope = &scope_init;
 static HashMap symbols;
 static Obj *empty_name; // __FUNCTION__ outside of any function
+
+// Static-storage initializer images (Obj init_data) are heap buffers that live
+// for the whole compilation (the backend reads them at emission); library mode
+// frees them in parse_reset. Too large in general for an arena pool.
+static struct {
+  void **data;
+  int capacity;
+  int len;
+} init_data_bufs;
+
+static void *alloc_init_data(int64_t sz, bool clear) {
+  void *buf = clear ? calloc(1, sz) : malloc(sz);
+  if (init_data_bufs.len >= init_data_bufs.capacity) {
+    init_data_bufs.capacity = init_data_bufs.capacity ? init_data_bufs.capacity * 2 : 32;
+    init_data_bufs.data =
+      realloc(init_data_bufs.data, init_data_bufs.capacity * sizeof(void *));
+  }
+  init_data_bufs.data[init_data_bufs.len++] = buf;
+  return buf;
+}
 static FuncContext *fnctx;
 static bool *eval_recover;
 
@@ -2535,7 +2555,7 @@ static void create_lvar_init(Node **cur, Initializer *init, InitDesg *desg, Toke
     Token *str = init->tok;
     Obj *var = new_anon_gvar(init->ty);
     var->is_string_lit = true;
-    var->init_data = malloc(init->ty->size);
+    var->init_data = alloc_init_data(init->ty->size, false);
 
     if (init->ty->size <= str->ty->size) {
       memcpy(var->init_data, str->str, init->ty->size);
@@ -2560,7 +2580,7 @@ static void create_lvar_init(Node **cur, Initializer *init, InitDesg *desg, Toke
     Obj *var = new_anon_gvar(init->ty);
     int64_t fill_sz = init->numseq.len * init->ty->base->size;
     var->is_string_lit = true;
-    var->init_data = malloc(init->ty->size);
+    var->init_data = alloc_init_data(init->ty->size, false);
 
     write_gvar_data(NULL, init, var->init_data, 0, EV_CONST);
 
@@ -2868,7 +2888,7 @@ static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
   initializer(rest, tok, &init, var);
 
   Relocation head = {0};
-  char *buf = calloc(1, var->ty->size);
+  char *buf = alloc_init_data(var->ty->size, true);
 
   write_gvar_data(&(Relocation *){&head}, &init, buf, 0, EV_LABEL);
 
@@ -2900,7 +2920,7 @@ static void constexpr_initializer(Token **rest, Token *tok, Obj *init_var, Obj *
 
 static void constexpr_initializer2(Initializer *init, Obj *init_var, Obj *var) {
   Relocation head = {0};
-  char *buf = calloc(1, init_var->ty->size);
+  char *buf = alloc_init_data(init_var->ty->size, true);
 
   write_gvar_data(&(Relocation *){&head}, init, buf, 0, EV_CONST);
 
@@ -6370,6 +6390,11 @@ void parse_reset(void) {
   pending_scope_maps = NULL;
   pending_scope_maps_len = pending_scope_maps_cap = 0;
   empty_name = NULL;
+  for (int i = 0; i < init_data_bufs.len; i++)
+    free(init_data_bufs.data[i]);
+  free(init_data_bufs.data);
+  init_data_bufs.data = NULL;
+  init_data_bufs.len = init_data_bufs.capacity = 0;
   fnctx = NULL;
   eval_recover = NULL;
   jump_ctx = NULL;
