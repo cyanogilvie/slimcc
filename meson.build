@@ -20,6 +20,7 @@ embedded_headers = files(
   'slimcc_headers/include/bitint_builtins',
   'slimcc_headers/include/float.h',
   'slimcc_headers/include/iso646.h',
+  'slimcc_headers/include/limits.h',
   'slimcc_headers/include/math.h',
   'slimcc_headers/include/stdalign.h',
   'slimcc_headers/include/stdarg.h',

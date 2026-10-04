@@ -179,6 +179,7 @@ static Scope scope_init;
 static Obj *globals = &globals_init;
 static Scope *scope = &scope_init;
 static HashMap symbols;
+static Obj *empty_name; // __FUNCTION__ outside of any function
 static FuncContext *fnctx;
 static bool *eval_recover;
 
@@ -5850,7 +5851,6 @@ static Node *primary(Token **rest, Token *tok) {
 
   if (tok->kind == TK_FUNCTION) {
     if (!fnctx) {
-      static Obj *empty_name;
       if (!empty_name) {
         empty_name = new_anon_gvar(array_of(add_qual(Q_CONST, ty_pchar, tok), 1));
         empty_name->init_data = arena_strdup(&cc1_arena, "");
@@ -6369,6 +6369,7 @@ void parse_reset(void) {
   free(pending_scope_maps);
   pending_scope_maps = NULL;
   pending_scope_maps_len = pending_scope_maps_cap = 0;
+  empty_name = NULL;
   fnctx = NULL;
   eval_recover = NULL;
   jump_ctx = NULL;

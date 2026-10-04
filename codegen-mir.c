@@ -150,13 +150,6 @@ static MIR_type_t mir_type(Type *ty) {
   case TY_ARRAY:
   case TY_VLA:
   case TY_FUNC: return MIR_T_I64;
-  case TY_ENUM:
-    switch (ty->size) {
-    case 1: return ty->is_unsigned ? MIR_T_U8 : MIR_T_I8;
-    case 2: return ty->is_unsigned ? MIR_T_U16 : MIR_T_I16;
-    case 4: return ty->is_unsigned ? MIR_T_U32 : MIR_T_I32;
-    default: return ty->is_unsigned ? MIR_T_U64 : MIR_T_I64;
-    }
   case TY_BITINT:
     if (ty->bit_cnt <= 64) {
       switch (ty->size) {
@@ -234,9 +227,9 @@ static int32_t obj_align(Obj *var) {
 }
 
 static void alloca_obj(Obj *var) {
-  // A VLA local's slot holds the runtime pointer; the ND_ALLOCA emitted by
-  // the parser for the declaration stores into it.
-  int64_t size = var->ty->kind == TY_VLA ? 8 : var->ty->size;
+  // VLAs are not scope locals: each is an OBJ_INDIR Obj whose vptr (an
+  // ordinary pointer-sized local) holds the runtime allocation.
+  int64_t size = var->ty->size;
   if (size < 0)
     error("variable '%s' has incomplete type", var->name ? var->name : "");
 
@@ -702,7 +695,7 @@ static MIR_insn_code_t arith_code(NodeKind kind, Type *ty, Token *tok) {
       if (ty->is_unsigned)
         return s4 ? MIR_UDIVS : MIR_UDIV;
       return s4 ? MIR_DIVS : MIR_DIV;
-    case ND_MOD:
+    case ND_REM:
       if (ty->is_unsigned)
         return s4 ? MIR_UMODS : MIR_UMOD;
       return s4 ? MIR_MODS : MIR_MOD;
@@ -836,6 +829,8 @@ static MIR_reg_t value_of_bits(Type *ty, MIR_reg_t bits) {
 }
 
 static void gen_mem_zero(MIR_reg_t addr, int64_t size) {
+  if (size <= 0)
+    return;
   MIR_item_t ms = get_memset();
   MIR_reg_t res = new_tmp(MIR_T_I64);
   out(MIR_new_insn_arr(mc, MIR_CALL, 6,
@@ -844,6 +839,8 @@ static void gen_mem_zero(MIR_reg_t addr, int64_t size) {
 }
 
 static void gen_mem_copy(MIR_reg_t dst, MIR_reg_t src, int64_t size) {
+  if (size <= 0)
+    return;
   MIR_item_t mcp = get_memcpy();
   MIR_reg_t res = new_tmp(MIR_T_I64);
   out(MIR_new_insn_arr(mc, MIR_CALL, 6,
@@ -1020,7 +1017,7 @@ static MIR_reg_t gen_bitint_arith(Node *node) {
   case ND_SUB: bitint_call(BI_SUB, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
   case ND_MUL: bitint_call(BI_MUL, 3, (MIR_op_t[]){bits, rop(lhs), rop(rhs)}); break;
   case ND_DIV:
-  case ND_MOD:
+  case ND_REM:
     bitint_call(BI_DIV, 5, (MIR_op_t[]){bits, rop(lhs), rop(rhs), iop(ty->is_unsigned),
                                         iop(node->kind == ND_DIV)});
     break;
@@ -1049,7 +1046,7 @@ static MIR_reg_t gen_bitint_cmp(Node *node) {
 }
 
 static int32_t ovf_headroom(Type *ty, NodeKind kind) {
-  int32_t bits = (ty->kind == TY_BOOL) ? 1 : bit_size(ty);
+  int32_t bits = bit_size(ty);
 
   if (kind == ND_MUL)
     return bits * 2 + ty->is_unsigned;
@@ -1203,17 +1200,16 @@ static MIR_reg_t gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
     Obj *var = node->m.var;
-    if (var->is_local && !var->is_static_lvar) {
-      // A VLA variable's slot holds the pointer to its allocation.
-      if (var->ty->kind == TY_VLA)
-        return load_scalar(ty_long, local_addr(var), 0);
+    // A VLA variable's vptr slot holds the pointer to its allocation.
+    if (var->kind == OBJ_INDIR)
+      return load_scalar(ty_long, local_addr(var->vptr), 0);
+    if (var->kind == OBJ_LOCAL && !var->is_static_lvar)
       return local_addr(var);
-    }
     // Thread-local: resolve the per-thread copy through the emutls runtime
     // (native TLS needs dynamic-linker cooperation that JIT-loaded modules
     // cannot get). The runtime honors the control object's alignment, so
     // the over-aligned rounding below doesn't apply.
-    if (var->is_tls) {
+    if (var->kind == OBJ_TLS) {
       MIR_item_t proto;
       MIR_item_t fn = get_emutls(&proto);
       MIR_reg_t ctrl = new_tmp(MIR_T_I64);
@@ -1504,7 +1500,7 @@ static MIR_reg_t gen_expr(Node *node) {
     out(MIR_new_insn(mc, cmp_code(node->m.lhs->ty, node->kind - ND_EQ), rop(r), rop(lhs), rop(rhs)));
     return r;
   }
-  case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_MOD:
+  case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_REM:
   case ND_BITAND: case ND_BITOR: case ND_BITXOR:
   case ND_SHL: case ND_SHR: case ND_SAR: {
     if (is_big_bitint(node->m.lhs->ty))
@@ -1540,9 +1536,9 @@ static MIR_reg_t gen_expr(Node *node) {
                                         MIR_new_ref_op(mc, ms), rop(res), rop(r), iop(0),
                                         rop(sz)}));
     }
-    // A VLA declaration stores the allocation into the variable's slot.
+    // A VLA declaration stores the allocation into the variable's vptr slot.
     if (node->m.var)
-      store_scalar(ty_long, local_addr(node->m.var), 0, r);
+      store_scalar(ty_long, local_addr(node->m.var->vptr), 0, r);
     return r;
   }
   case ND_LABEL_VAL: {
@@ -1776,6 +1772,16 @@ static void gen_cond(Node *node, bool jump_on_true, MIR_label_t lab) {
 
 static void gen_return(Node *node) {
   Type *rt = cur_fn->ty->return_ty;
+
+  // `return void_expr;` in a void function and zero-sized aggregate returns
+  // carry no value: evaluate for side effects only.
+  if (node->m.lhs && (rt->kind == TY_VOID || node->m.lhs->ty->size <= 0)) {
+    gen_void_expr(node->m.lhs);
+    if (has_defr(node))
+      gen_defr(node);
+    out(MIR_new_ret_insn(mc, 0));
+    return;
+  }
 
   if (rt->kind == TY_STRUCT || rt->kind == TY_UNION || is_big_bitint(rt)) {
     if (node->m.lhs) {
@@ -2121,7 +2127,7 @@ static void emit_data_obj(Obj *var) {
   // __slimcc_emutls_get_address, plus the init image as an ordinary
   // module-local data object. All code references go through the control
   // object (see gen_addr), so the variable's own name is never defined.
-  if (var->is_tls) {
+  if (var->kind == OBJ_TLS) {
     const char *name = sym_name(var);
     const char *name_t = arena_format(&cc1_arena, "__emutls_t.%s", name);
     const char *name_v = arena_format(&cc1_arena, "__emutls_v.%s", name);
@@ -2142,7 +2148,7 @@ static void emit_data_obj(Obj *var) {
     // template's own address and alignment conventions don't matter; clamp
     // the alignment so emission doesn't take the over-aligned bss path.
     Obj tmp = *var;
-    tmp.is_tls = false;
+    tmp.kind = OBJ_GLOBAL;
     tmp.is_static = true;
     tmp.name = (char *)name_t;
     tmp.asm_name = tmp.alias_name = NULL;
@@ -2201,7 +2207,7 @@ static void emit_data_obj(Obj *var) {
   // address is rounded up past that) cannot be expressed.
   for (Relocation *rel = var->rel; rel; rel = rel->next)
     if (rel->var) {
-      if (rel->var->is_tls)
+      if (rel->var->kind == OBJ_TLS)
         error("static initializer takes the address of thread-local '%s', "
               "which is not supported by the MIR backend", sym_name(rel->var));
       if (obj_align(rel->var) > 16 && rel->var->ty->kind != TY_FUNC)

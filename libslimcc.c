@@ -44,6 +44,7 @@ bool opt_fake_always_inline;
 
 bool opt_E;
 bool opt_dM;
+bool opt_P;
 bool opt_pie;
 bool opt_nopie;
 bool opt_pthread;
@@ -673,9 +674,9 @@ static MIR_debug_type_t intern_type(Type *ty) {
   for (int i = 0; i < dbg_visit.len; i++)
     if (dbg_visit.k[i] == ty) return dbg_visit.v[i];
 
-  // Enum variables carry their underlying integer kind but keep the enumerator
-  // list; emit a real enumeration_type so a debugger shows enumerator names.
-  if (ty->enums != NULL && ty->kind != TY_ENUM) {
+  // Enums are their underlying integer kind but keep the enumerator list;
+  // emit a real enumeration_type so a debugger shows enumerator names.
+  if (ty->enums != NULL) {
     char *tag = dbg_tokname(ty->tag);
     MIR_debug_type_t h = MIR_debug_enum_type(slimcc_dbg, tag ? tag : "", ty->size);
     free(tag);
@@ -736,18 +737,6 @@ static MIR_debug_type_t intern_type(Type *ty) {
                                (int64_t)m->offset * 8 + m->bit_offset, m->bit_width);
       else
         MIR_debug_add_member(slimcc_dbg, h, nm ? nm : "", mt, m->offset);
-      free(nm);
-    }
-    return h;
-  }
-  case TY_ENUM: {
-    char *tag = dbg_tokname(ty->tag);
-    MIR_debug_type_t h = MIR_debug_enum_type(slimcc_dbg, tag ? tag : "", ty->size);
-    free(tag);
-    dbg_visit_add(ty, h);
-    for (EnumVal *e = ty->enums; e; e = e->next) {
-      char *nm = dbg_tokname(e->name);
-      MIR_debug_add_enumerator(slimcc_dbg, h, nm ? nm : "", e->val);
       free(nm);
     }
     return h;
