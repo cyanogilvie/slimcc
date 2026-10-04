@@ -708,9 +708,10 @@ static void push_var_name2(const char *key, int keylen, Token *tok, Obj *var) {
   VarScope *vsc = push_var_scope(key, keylen, var);
   if (vsc)
     error_tok(tok, "redeclaration of '%.*s'", keylen, key);
-  // For debug info, retain the name on the local Obj: the scope's name map is
-  // freed during parsing, so the backend can't recover it otherwise.
-  if (opt_g && var != NULL && var->kind == OBJ_LOCAL && var->name == NULL)
+  // Retain the name on the local Obj: the scope's name map is freed during
+  // parsing, so the backend can't recover it otherwise. Needed for debug info
+  // (opt_g) and for naming MIR registers after their C variables (lib mode).
+  if ((opt_g || slimcc_lib_mode) && var != NULL && var->kind == OBJ_LOCAL && var->name == NULL)
     var->name = arena_format(&ast_arena, "%.*s", keylen, key);
 }
 

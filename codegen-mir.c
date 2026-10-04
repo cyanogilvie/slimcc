@@ -34,6 +34,7 @@ static int64_t ctrl_cnt;
 
 static HashMap sym_items;  // symbol name -> SymItem (module lifetime)
 static HashMap label_map;  // label key -> MIR_label_t (function lifetime)
+static HashMap reg_names;  // taken "C%name" reg names (function lifetime)
 
 static MIR_item_t memset_import, memcpy_import;
 static MIR_item_t memset_proto, memcpy_proto;
@@ -110,6 +111,24 @@ static MIR_reg_t new_tmp(MIR_type_t ty) {
   char buf[32];
   snprintf(buf, sizeof(buf), "T%" PRIi64, tmp_cnt++);
   return MIR_new_func_reg(mc, fn_func, ty, buf);
+}
+
+// A MIR register name for a C variable, so dumps read back against the source.
+// C names are namespaced under "C%": '%' is illegal in a C identifier and "C%"
+// matches none of MIR's reserved prefixes ("hr", "t", ".lc") nor this
+// backend's "T<n>" temps, so a source name can never alias a temp, hard reg or
+// reserved reg. Shadowed identifiers (same name in nested scopes) get a ".<n>"
+// suffix to stay distinct within the function.
+static const char *cvar_reg_name(const char *cname) {
+  for (int n = 0;; n++) {
+    const char *key = n ? arena_format(&cc1_arena, "C%%%s.%d", cname, n)
+                        : arena_format(&cc1_arena, "C%%%s", cname);
+    HashEntry *ent = hashmap_get_or_insert(&reg_names, key, strlen(key));
+    if (!ent->val) {
+      ent->val = (void *)key;
+      return key;
+    }
+  }
 }
 
 static MIR_op_t rop(MIR_reg_t r) {
@@ -243,7 +262,9 @@ static void alloca_obj(Obj *var) {
   // Address never taken and scalar: keep the value in a MIR register and skip
   // the stack slot entirely. Reads return the register; writes move into it.
   if (promote_local(var)) {
-    var->ofs = (int)new_tmp(mir_class(var->ty));
+    MIR_type_t cls = mir_class(var->ty);
+    var->ofs = (int)(var->name ? MIR_new_func_reg(mc, fn_func, cls, cvar_reg_name(var->name))
+                               : new_tmp(cls));
     var->ptr = mir_regval_marker;
     return;
   }
@@ -2270,6 +2291,8 @@ void emit_text(Obj *fn) {
   scratch_slot = 0;
   free(label_map.buckets);
   label_map = (HashMap){0};
+  free(reg_names.buckets);
+  reg_names = (HashMap){0};
 
   // Signature. Aggregates and big bitints travel as MIR block args;
   // struct and big-bitint returns become a hidden first RBLK argument
@@ -2590,6 +2613,8 @@ void codegen_mir_reset(void) {
   sym_items = (HashMap){0};
   free(label_map.buckets);
   label_map = (HashMap){0};
+  free(reg_names.buckets);
+  reg_names = (HashMap){0};
 }
 
 void codegen_mir_begin(MIR_context_t ctx, const char *module_name) {

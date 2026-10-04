@@ -32,6 +32,7 @@ Scalar locals whose address is never taken live in a MIR register (`var->ptr == 
 - **Fail-safe:** `gen_addr` on a promoted local is `internal_error()` — a scan gap becomes a clean compile error, never a miscompile. Any node kind the scan doesn't know sets `no_promote` for the whole function; add new AST kinds to `scan_node` when the backend learns them.
 - Disabled per function for `opt_g` (DWARF needs stable frame slots) and `dont_reuse_stk` (a `returns_twice` callee such as setjmp: register values don't survive longjmp). Never promoted: aggregates/VLAs/big `_BitInt` (`is_addr_value`), `volatile`/`_Atomic`, static locals.
 - Writes go through `set_regval`, which canonicalizes exactly as a memory load would (narrow ints extended, small `_BitInt` normalized), so reads can return the register verbatim. `x++` snapshots the old value into a fresh register before the write.
+- Promoted registers are named after their C variable via `cvar_reg_name` (`C%name`, shadowed names `C%name.1`, …; per-function `reg_names` map) so MIR dumps read against the source; incoming args stay `A<n>` (a promoted param is `C%a` copied from `A0`), unnamed temps `T<n>`. This needs local names retained on the Obj in lib mode (`push_var_name2`), not just under `-g`.
 - A VLA's `vptr` is an ordinary promotable local: use `get_local`/`set_local` (register-or-slot) for it, never `local_addr`.
 - Validated by jitc's `tests/promotion.test` (IR shape: no `alloca`/memory operands for promoted scalars; runtime: compound-assign, inc/dec, narrow ints, floats, mixed address-taken).
 
