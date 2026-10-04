@@ -2132,13 +2132,31 @@ static void gen_return(Node *node) {
   out(MIR_new_ret_insn(mc, 1, rop(v)));
 }
 
+// Stamp subsequently emitted insns with tok's source location (debug builds).
+// The file id lookup is a linear scan in libslimcc, so remember the last File
+// (reset per compile: File structs are freed between compilations).
+static File *loc_file;
+static int loc_file_id;
+
+static void stamp_loc(Token *tok) {
+  if (!tok || !tok->file)
+    return;
+  if (tok->file != loc_file) {
+    loc_file = tok->file;
+    loc_file_id = slimcc_debug_intern_file(tok->file->name);
+  }
+  MIR_set_source_loc(mc, loc_file_id, tok->line_no);
+}
+
 static void gen_stmt(Node *node) {
   // In debug mode, stamp this statement's source location onto the insns it
   // emits so MIR can build a line map (DWARF .debug_line). Recursive gen_stmt
-  // calls restamp per nested statement, giving line granularity.
-  if (opt_g && node->tok && node->tok->file)
-    MIR_set_source_loc(mc, slimcc_debug_intern_file(node->tok->file->name),
-                       node->tok->line_no);
+  // calls restamp per nested statement, giving line granularity. An expression
+  // statement's own token is the one *after* its expression (the `;` - so a
+  // multi-line statement would report its last line - or, for a declaration's
+  // initializers, the next statement's first token), so use the expression's.
+  if (opt_g)
+    stamp_loc(node->kind == ND_EXPR_STMT && node->m.lhs ? node->m.lhs->tok : node->tok);
   switch (node->kind) {
   case ND_NULL_STMT:
     return;
@@ -2350,9 +2368,8 @@ void emit_text(Obj *fn) {
   // Attribute the prologue (local allocas + parameter spills below) to the
   // function's opening line, so `break func` / its entry maps there rather
   // than inheriting a later statement's line.
-  if (opt_g && fn->body && fn->body->tok && fn->body->tok->file)
-    MIR_set_source_loc(mc, slimcc_debug_intern_file(fn->body->tok->file->name),
-                       fn->body->tok->line_no);
+  if (opt_g && fn->body)
+    stamp_loc(fn->body->tok);
 
   // Decide register promotion before laying out slots. Disabled wholesale for
   // debug builds (so every local keeps a stable frame slot DWARF can name)
@@ -2614,6 +2631,7 @@ int codegen(Obj *prog, FILE *out_file) {
 // so this state is not retained idle until the next compile; codegen_mir_begin
 // also calls it defensively in case a prior compile ended abnormally.
 void codegen_mir_reset(void) {
+  loc_file = NULL;
   for (int32_t i = 0; i < sym_items.capacity; i++) {
     HashEntry *ent = &sym_items.buckets[i];
     if (ent->key && ent->key != TOMBSTONE)
