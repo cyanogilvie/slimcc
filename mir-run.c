@@ -8,7 +8,6 @@
 #include "libslimcc.h"
 #include "mir-gen.h"
 #include <dlfcn.h>
-#include <libgen.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,16 +23,6 @@ static void unresolved_symbol_trap(void) {
 static void *import_resolver(const char *name) {
   void *addr = dlsym(RTLD_DEFAULT, name);
   return addr ? addr : (void *)unresolved_symbol_trap;
-}
-
-// slimcc's builtin freestanding headers (stddefer.h, stdarg.h, ...) live
-// next to the compiler binary, like the CLI driver expects.
-static char *builtin_include_dir(const char *argv0) {
-  static char buf[4096];
-  char tmp[4096];
-  snprintf(tmp, sizeof(tmp), "%s", argv0);
-  snprintf(buf, sizeof(buf), "%s/slimcc_headers/include", dirname(tmp));
-  return buf;
 }
 
 static char *read_all(FILE *fp) {
@@ -52,10 +41,13 @@ static char *read_all(FILE *fp) {
 int main(int argc, char **argv, char **envp) {
   int argi = 1;
   bool dump = false;
-  const char *incl[17];
+  // slimcc's own headers (stdarg.h, stddefer.h, ...) are embedded in the
+  // library and searched first; only caller paths go here. Adding the on-disk
+  // slimcc_headers/include too would make each #include_next wrapper
+  // (math.h, limits.h) find its own duplicate instead of the system header.
+  const char *incl[16];
   int n_incl = 0;
 
-  incl[n_incl++] = builtin_include_dir(argv[0]);
   for (; argi < argc; argi++) {
     if (!strcmp(argv[argi], "-d")) {
       dump = true;
