@@ -258,13 +258,18 @@ static int32_t obj_align(Obj *var) {
   return var->alt_align ? var->alt_align : var->ty->align;
 }
 
+// The register representing a local: "C%name" for named C variables (see
+// cvar_reg_name), an anonymous temp for compiler-created ones.
+static MIR_reg_t local_reg(Obj *var, MIR_type_t cls) {
+  return var->name ? MIR_new_func_reg(mc, fn_func, cls, cvar_reg_name(var->name))
+                   : new_tmp(cls);
+}
+
 static void alloca_obj(Obj *var) {
   // Address never taken and scalar: keep the value in a MIR register and skip
   // the stack slot entirely. Reads return the register; writes move into it.
   if (promote_local(var)) {
-    MIR_type_t cls = mir_class(var->ty);
-    var->ofs = (int)(var->name ? MIR_new_func_reg(mc, fn_func, cls, cvar_reg_name(var->name))
-                               : new_tmp(cls));
+    var->ofs = (int)local_reg(var, mir_class(var->ty));
     var->ptr = mir_regval_marker;
     return;
   }
@@ -276,15 +281,18 @@ static void alloca_obj(Obj *var) {
     error("variable '%s' has incomplete type", var->name ? var->name : "");
 
   // MIR allocas pack tightly; rounding every slot to 16 bytes keeps slots
-  // naturally aligned. Stricter alignment over-allocates and masks.
+  // naturally aligned. Stricter alignment over-allocates and masks. The slot
+  // register holds the variable's address, so accesses read as `i32:(C%x)`;
+  // an over-aligned slot names the rounded address, not the raw allocation.
   int32_t align = obj_align(var);
-  MIR_reg_t r = new_tmp(MIR_T_I64);
+  MIR_reg_t r = local_reg(var, MIR_T_I64);
   if (align <= 16) {
     out(MIR_new_insn(mc, MIR_ALLOCA, rop(r), iop(align_to(MAX(size, 1), 16))));
   } else {
-    out(MIR_new_insn(mc, MIR_ALLOCA, rop(r), iop(align_to(size, 16) + align)));
-    r = i64_op2(MIR_ADD, r, iop(align - 1));
-    r = i64_op2(MIR_AND, r, iop(-(int64_t)align));
+    MIR_reg_t raw = new_tmp(MIR_T_I64);
+    out(MIR_new_insn(mc, MIR_ALLOCA, rop(raw), iop(align_to(size, 16) + align)));
+    raw = i64_op2(MIR_ADD, raw, iop(align - 1));
+    out(MIR_new_insn(mc, MIR_AND, rop(r), rop(raw), iop(-(int64_t)align)));
   }
   var->ofs = (int)r;
   var->ptr = mir_local_marker;
