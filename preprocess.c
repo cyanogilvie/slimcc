@@ -336,6 +336,9 @@ static Token *new_str_token(const char *str, Token *orig) {
   memcpy(buf + 1, str, len);
   buf[0] = buf[len + 1] = '"';
   buf[len + 2] = '\0';
+  // The tokens point into buf for the rest of the compilation, like a source
+  // file's contents; library mode frees it with those in tokenize_reset.
+  track_file_contents(buf);
   return make_token(buf, orig, orig->next);
 }
 
@@ -694,7 +697,10 @@ static Token *stringize(Token *hash, Token *tok) {
       cur = cur->next = tok;
   cur->next = tok;
 
-  return new_str_token(join_tokens(head.next, tok, true), hash);
+  char *str = join_tokens(head.next, tok, true);
+  Token *t = new_str_token(str, hash);
+  free(str);
+  return t;
 }
 
 static void align_token(Token *tok1, Token *tok2) {
@@ -1111,8 +1117,11 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
 
     if (!is_expanded && start->file == tok->file && start->loc < tok->loc)
       filename = arena_copy_string(&cc1_arena, start->loc + 1, tok->loc - start->loc - 1);
-    else
-      filename = join_tokens(start->next, tok, false);
+    else {
+      char *joined = join_tokens(start->next, tok, false);
+      filename = arena_strdup(&cc1_arena, joined);
+      free(joined);
+    }
   }
 
   if (filename && *filename != '\0') {
@@ -1929,6 +1938,11 @@ static void join_adjacent_string_literals(Token *tok) {
   tok->next = end;
 }
 
+// Process-lifetime cache (is_gnu_attr's map), kept across compilations;
+// registered so preprocess_shutdown can release it for library mode's final
+// teardown.
+static HashMap *gnu_attr_map;
+
 static bool is_gnu_attr(Token *tok) {
 #define PutAttr(str)                             \
   do {                                           \
@@ -1937,6 +1951,7 @@ static bool is_gnu_attr(Token *tok) {
   } while (0)
 
   static HashMap map;
+  gnu_attr_map = &map;
   if (map.capacity == 0) {
     PutAttr("alias");
     PutAttr("aligned");
@@ -2443,6 +2458,13 @@ Token *pp_install(const PchState *s) {
 // Reset all preprocessor state so a new compilation can run in the same
 // process (library mode). Storage reachable from the maps is owned by the
 // arenas or freed in prepare_parse; remaining buckets are freed here.
+void preprocess_shutdown(void) {
+  if (gnu_attr_map) {
+    free(gnu_attr_map->buckets);
+    *gnu_attr_map = (HashMap){0};
+  }
+}
+
 void preprocess_reset(void) {
   free(macros.buckets);
   free(pragma_once.buckets);

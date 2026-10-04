@@ -571,13 +571,17 @@ void slimcc_register_helpers(MIR_context_t ctx) {
 }
 
 void slimcc_shutdown(void) {
-  // Per-compile state is already freed at the end of each compile; the one
-  // thing that persists across compiles is the arena pool freelist that
-  // arena_off keeps for reuse. Release it (plus a defensive reset_all() in case
+  // Per-compile state is already freed at the end of each compile; what
+  // persists across compiles is the arena pool freelist that arena_off keeps
+  // for reuse and the tokenizer/preprocessor's lazily built lookup caches
+  // (keyword and attribute maps, digit-separator scratch buffer). Release
+  // them (plus a defensive reset_all() in case
   // shutdown is reached in an unexpected state). Intended for a final
   // library-mode shutdown (an embedder unloaded from a host that outlives it);
   // compiling again afterwards simply rebuilds everything on demand.
   reset_all();
+  tokenize_shutdown();
+  preprocess_shutdown();
   arena_free_pools();
   slimcc_debug_reset();
 }

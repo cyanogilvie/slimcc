@@ -483,6 +483,8 @@ void tok_free(Token *t);
 void slimcc_vfile_add(const char *name, const char *contents);
 const char *slimcc_vfile_get(const char *name);
 void tokenize_reset(void);
+void tokenize_shutdown(void);
+void track_file_contents(char *buf);
 
 #define internal_error() error_ice(__FILE__, __LINE__)
 
@@ -509,6 +511,7 @@ PchState *pp_snapshot(Arena *arena, Token *preamble_toks);
 Token *pp_install(const PchState *s);
 void pp_free_state(PchState *s);
 void preprocess_reset(void);
+void preprocess_shutdown(void);
 extern Token *last_alloc_tok;
 extern Token *tok_freelist;
 

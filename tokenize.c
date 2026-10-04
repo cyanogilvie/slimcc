@@ -368,8 +368,16 @@ static int read_punct(const char *p, TokenKind *k) {
   return 0;
 }
 
+// Process-lifetime caches below are built on first use and kept across
+// compilations; they register here so tokenize_shutdown can release them for
+// library mode's final teardown.
+static HashMap *keyword_map;
+static char **digit_sep_buf;
+static size_t *digit_sep_buflen;
+
 TokenKind ident_keyword(Token *tok) {
   static HashMap map;
+  keyword_map = &map;
 
   if (map.capacity == 0) {
     hashmap_put(&map, "return", (void *)TK_return);
@@ -973,6 +981,7 @@ static const char *filter_digit_sep(Token *tok, int *len) {
 
   static size_t buflen;
   static char *buf;
+  digit_sep_buf = &buf, digit_sep_buflen = &buflen;
 
   if (tok->len >= buflen) {
     buflen = tok->len + 1;
@@ -1334,7 +1343,7 @@ static struct {
   int len;
 } file_pool;
 
-static void track_file_contents(char *buf) {
+void track_file_contents(char *buf) {
   if (file_contents.len >= file_contents.capacity) {
     file_contents.capacity = file_contents.capacity ? file_contents.capacity * 2 : 32;
     file_contents.data =
@@ -1496,6 +1505,18 @@ static void remove_backslash_newline(char *start, SlashDelta *dlt) {
 // (library mode). The display-file map's index storage lives in pp_arena,
 // so it must not survive across compilations. Registered virtual files are
 // caller-owned and deliberately kept.
+void tokenize_shutdown(void) {
+  if (keyword_map) {
+    free(keyword_map->buckets);
+    *keyword_map = (HashMap){0};
+  }
+  if (digit_sep_buf) {
+    free(*digit_sep_buf);
+    *digit_sep_buf = NULL;
+    *digit_sep_buflen = 0;
+  }
+}
+
 void tokenize_reset(void) {
   current_file = NULL;
   at_bol = has_space = false;
