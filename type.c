@@ -654,12 +654,20 @@ Type *vla_of(Type *base, Node *len, int64_t arr_len) {
 // [libslimcc] The -W checks on pointer conversions in assignment, as gcc's
 // defaults (and tcc's): pointee types that differ other than in the signedness
 // of an integer type, or that lose a const/volatile qualifier.
+// Integer kind ignoring signedness: plain char (TY_PCHAR) is its own kind,
+// but char* <-> unsigned char* is only a signedness difference (gcc's
+// -Wpointer-sign), not an incompatible pointer
+static TypeKind int_kind_nosign(Type *t) {
+  return t->kind == TY_PCHAR ? TY_CHAR : t->kind;
+}
+
 static void chk_ptr_assign(Type *to_ty, Node *expr) {
   if (to_ty->kind != TY_PTR || expr->ty->kind != TY_PTR)
     return;
   Type *to = to_ty->base, *from = expr->ty->base;
   if (to->kind != TY_VOID && from->kind != TY_VOID && !is_compatible(to, from) &&
-      !(is_integer(to) && is_integer(from) && to->kind == from->kind && to->size == from->size)) {
+      !(is_integer(to) && is_integer(from) && int_kind_nosign(to) == int_kind_nosign(from) &&
+        to->size == from->size)) {
     warn_opt_tok(WARN_INCOMPATIBLE_POINTER_TYPES, expr->tok,
                  "assignment from incompatible pointer type");
     return;
