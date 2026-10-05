@@ -2262,6 +2262,12 @@ struct PchState {
   HashMap include_guards; // path -> guard name
   char **filebufs;        // malloc'd File content copies (too big for the arena)
   int n_filebufs, cap_filebufs;
+  // display_files as the pch build left it. Preamble tokens (and their File
+  // copies) carry display_file_no / file_no indices into that table, so each
+  // compile installing the pch must start from the same table, in the same
+  // order, before the body adds its own files.
+  char **display_files;
+  int n_display_files;
 };
 
 // While copying a token chain into a persistent arena, each distinct source
@@ -2388,6 +2394,10 @@ PchState *pp_snapshot(Arena *arena, Token *preamble_toks) {
   }
   pch_copy_strmap(arena, &s->pragma_once, &pragma_once, false);
   pch_copy_strmap(arena, &s->include_guards, &include_guards, true);
+  s->n_display_files = display_files.len;
+  s->display_files = arena_malloc(arena, (display_files.len ? display_files.len : 1) * sizeof *s->display_files);
+  for (int i = 0; i < display_files.len; i++)
+    s->display_files[i] = arena_strdup(arena, display_files.data[i]);
   free(fm.data);
   return s;
 }
@@ -2452,6 +2462,12 @@ Token *pp_install(const PchState *s) {
   include_guards = (HashMap){0};
   pch_install_strmap(&pragma_once, &s->pragma_once);
   pch_install_strmap(&include_guards, &s->include_guards);
+  // Runs on a fresh (empty) display_files, so re-adding the snapshot's names
+  // in order reproduces the indices the preamble tokens carry (the names are
+  // already distinct: add_display_file deduplicated them when the pch was
+  // built). Diagnostics and debug line info look files up by those indices.
+  for (int i = 0; i < s->n_display_files; i++)
+    add_display_file(s->display_files[i]);
   return pch_instantiate_toks(s->toks);
 }
 
