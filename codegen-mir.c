@@ -1399,11 +1399,20 @@ static MIR_reg_t gen_funcall(Node *node) {
     internal_error();
 
   // Callee: a direct reference or a function pointer value.
+  // A direct call to an 'inline' (or always_inline) function is emitted as
+  // MIR_INLINE, as c2mir does: MIR_link then inlines callees of up to
+  // MIR_MAX_INSNS_FOR_INLINE (200) insns rather than MIR_CALL's 50. It's
+  // still subject to the caller growth limits, and to inline permission
+  // (debug builds turn inlining off).
   MIR_op_t fn_op;
-  if (fn_expr->kind == ND_VAR && fn_expr->m.var->ty->kind == TY_FUNC)
+  MIR_insn_code_t call_code = MIR_CALL;
+  if (fn_expr->kind == ND_VAR && fn_expr->m.var->ty->kind == TY_FUNC) {
     fn_op = MIR_new_ref_op(mc, sym_item(fn_expr->m.var));
-  else
+    if (fn_expr->m.var->is_inline || fn_expr->m.var->is_always_inline)
+      call_code = MIR_INLINE;
+  } else {
     fn_op = rop(gen_expr(fn_expr));
+  }
 
   int nparams = 0;
   for (Obj *arg = node->call.args; arg; arg = arg->param_next)
@@ -1461,7 +1470,7 @@ static MIR_reg_t gen_funcall(Node *node) {
   for (i = 0; i < nargs; i++)
     ops[2 + nres + i] = argops[i];
 
-  out(MIR_new_insn_arr(mc, MIR_CALL, nops, ops));
+  out(MIR_new_insn_arr(mc, call_code, nops, ops));
 
   if (rtn_by_addr)
     return local_addr(node->call.rtn_buf);

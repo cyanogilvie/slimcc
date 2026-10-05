@@ -1104,6 +1104,8 @@ static void func_attr(Token *name, Token *tok, VarAttr *attr, Obj *fn) {
 
   fn->is_gnu_inline |= attr->is_gnu_inline;
   DeclAttr(bool_attr, "gnu_inline", &fn->is_gnu_inline);
+
+  fn->is_inline |= !!(attr->strg & SC_INLINE);
 }
 
 static void mem_attr(Token *name, Token *tok, VarAttr *attr, Member *mem) {

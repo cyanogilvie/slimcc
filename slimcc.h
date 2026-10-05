@@ -576,6 +576,7 @@ struct Obj {
   bool export_fn_gnu;
   bool is_gnu_inline;
   bool is_always_inline;
+  bool is_inline; // declared 'inline' (a hint for the MIR backend)
   bool is_naked;
   bool is_noreturn;
   bool returns_twice;
