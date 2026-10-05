@@ -478,6 +478,28 @@ void convert_ucn_ident(Token *tok);
 // Library (JIT) mode support
 extern FILE *slimcc_diag_file;
 extern bool slimcc_lib_mode;
+
+// Structured diagnostics: when set, called for every error (severity 0),
+// warning (1) and note (2) in addition to the text written to the diagnostics
+// sink. tok is NULL for diagnostics without a token; filename and input are
+// NULL for ones without a source location. option names the -W flag that
+// enabled a warning, else NULL.
+extern void (*slimcc_diag_hook)(int severity, const char *option, Token *tok,
+                                const char *filename, const char *input, int line_no,
+                                const char *loc, const char *msg);
+
+// Optional warnings, off unless enabled (library mode sets them per compile
+// from gcc-style -W flags; the CLI leaves them off, as upstream).
+typedef enum {
+  WARN_INCOMPATIBLE_POINTER_TYPES,
+  WARN_DISCARDED_QUALIFIERS,
+  WARN_INT_CONVERSION,
+  WARN_RETURN_TYPE,
+  WARN_COUNT,
+} WarnKind;
+extern bool warn_enabled[WARN_COUNT];
+extern const char *const warn_names[WARN_COUNT]; // without the leading "-W"
+void warn_opt_tok(WarnKind w, Token *tok, const char *fmt, ...) FMTCHK(3, 4);
 Token *tok_alloc(void);
 void tok_free(Token *t);
 void slimcc_vfile_add(const char *name, const char *contents);

@@ -97,7 +97,7 @@ bool in_sysincl_path(int idx) {
 bool ignore_missing_dep(const char *path, const char *filename, Token *tok) {
   if (!path) {
     if (tok)
-      error_tok(tok, "file not found");
+      error_tok(tok, "include file '%s' not found", filename);
     error("`%s` file not found", filename);
   }
   return false;
@@ -222,15 +222,127 @@ void run_subprocess(const char **argv) {
 // MIR error routing: format into the diagnostics stream, then unwind.
 //
 
+static void lib_diag_hook(int severity, const char *option, Token *tok, const char *filename,
+                          const char *input, int line_no, const char *loc, const char *msg);
+
 static void NORETURN mir_error(MIR_error_type_t type, const char *fmt, ...) {
-  FILE *f = slimcc_diag_file ? slimcc_diag_file : stderr;
+  char msg[1024];
   va_list ap;
   va_start(ap, fmt);
-  fprintf(f, "MIR error %d: ", (int)type);
-  vfprintf(f, fmt, ap);
-  fprintf(f, "\n");
+  int len = snprintf(msg, sizeof(msg), "MIR error %d: ", (int)type);
+  vsnprintf(msg + len, sizeof(msg) - len, fmt, ap);
   va_end(ap);
+  if (slimcc_diag_hook)
+    lib_diag_hook(0, NULL, NULL, NULL, NULL, 0, NULL, msg);
+  fprintf(slimcc_diag_file ? slimcc_diag_file : stderr, "%s\n", msg);
   cleanup_exit(1);
+}
+
+//
+// Structured diagnostics (slimcc_options.diag) and warning flags
+//
+
+static const slimcc_options *diag_opt; // the compile in progress
+static int diag_nwarn;                 // warnings it has reported
+static bool diag_werror;
+
+static void lib_diag_hook(int severity, const char *option, Token *tok, const char *filename,
+                          const char *input, int line_no, const char *loc, const char *msg) {
+  if (severity == SLIMCC_DIAG_WARNING)
+    diag_nwarn++;
+  if (!diag_opt || !diag_opt->diag)
+    return;
+
+  slimcc_diag d = {.severity = severity, .message = msg};
+  char optbuf[64];
+  if (option) {
+    snprintf(optbuf, sizeof(optbuf), "-W%s", option);
+    d.option = optbuf;
+  }
+
+  char dirbuf[1024];
+  if (input && loc) {
+    const char *bol = loc;
+    while (bol > input && bol[-1] != '\n')
+      bol--;
+    d.src_name = filename;
+    d.src = input;
+    d.src_len = strlen(input);
+    d.src_line = line_no;
+    d.column = (int)(loc - bol) + 1;
+    d.offset = (size_t)(loc - input);
+    d.length = tok ? (size_t)tok->len : 0;
+    d.file = filename;
+    d.line = line_no;
+    if (tok && !tok->file->is_placeholder && !tok->origin && tok->display_line_no) {
+      d.file = display_files.data[tok->display_file_no];
+      d.line = tok->display_line_no;
+    }
+
+    // Some errors leave their subject to the caret line ("undefined variable"):
+    // name it in the message, as tcc did, when the diagnosed token is it.
+    static const char *const names_subject[] = {
+      "undefined variable", "implicit declaration of a function", "no such member", "not a function",
+    };
+    char subjbuf[1024];
+    if (tok && tok->kind == TK_IDENT)
+      for (size_t i = 0; i < sizeof(names_subject) / sizeof(*names_subject); i++)
+        if (!strcmp(msg, names_subject[i])) {
+          snprintf(subjbuf, sizeof(subjbuf), "%s '%.*s'", msg, tok->len, tok->loc);
+          d.message = subjbuf;
+        }
+
+    // #error / #warning report just "error" / "warning" (the caret line of the
+    // text form shows the rest): give the directive's own text as the message.
+    if (tok && (!strcmp(msg, "error") || !strcmp(msg, "warning")) && equal(tok, msg)) {
+      const char *hash = bol;
+      while (*hash == ' ' || *hash == '\t')
+        hash++;
+      const char *eol = loc;
+      while (*eol && *eol != '\n')
+        eol++;
+      if (*hash == '#') {
+        snprintf(dirbuf, sizeof(dirbuf), "%.*s", (int)(eol - hash), hash);
+        d.message = dirbuf;
+      }
+    }
+  }
+
+  diag_opt->diag(diag_opt->diag_cdata, &d);
+}
+
+static void diag_end(void) {
+  slimcc_diag_hook = NULL;
+  diag_opt = NULL;
+  memset(warn_enabled, 0, sizeof(warn_enabled));
+}
+
+static void apply_warn_flags(const slimcc_options *opt) {
+  memset(warn_enabled, 0, sizeof(warn_enabled));
+  diag_werror = false;
+  if (!opt)
+    return;
+  for (int i = 0; i < opt->n_warn_flags; i++) {
+    const char *f = opt->warn_flags[i];
+    if (!f || strncmp(f, "-W", 2))
+      continue;
+    f += 2;
+    if (!strcmp(f, "all")) {
+      for (int w = 0; w < WARN_COUNT; w++)
+        warn_enabled[w] = true;
+      continue;
+    }
+    bool on = strncmp(f, "no-", 3) != 0;
+    if (!on)
+      f += 3;
+    if (!strcmp(f, "error")) {
+      diag_werror = on;
+      continue;
+    }
+    for (int w = 0; w < WARN_COUNT; w++)
+      if (!strcmp(f, warn_names[w]))
+        warn_enabled[w] = on;
+  }
 }
 
 static void lib_macros(void) {
@@ -312,6 +424,10 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 
   diag_buf = NULL;
   slimcc_diag_file = open_memstream(&diag_buf, &diag_len);
+  diag_opt = opt;
+  diag_nwarn = 0;
+  apply_warn_flags(opt);
+  slimcc_diag_hook = lib_diag_hook;
 
   // The whole pipeline, MIR build errors included, unwinds to here. On
   // failure the scratch context holds a half-built function/module; the
@@ -338,6 +454,7 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
     compile_active = false;
     parse_free_scopes(); // nested Scopes live in the still-on AST arena
     arenas_off();
+    diag_end();
     fclose(slimcc_diag_file);
     slimcc_diag_file = NULL;
     if (errmsg)
@@ -424,6 +541,10 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
 
   Obj *prog = parse(tok);
   codegen(prog, NULL);
+  // -Werror: fail once every warning has been reported (as tcc did), rather
+  // than at the first as the CLI's opt_werror does.
+  if (diag_werror && diag_nwarn)
+    cleanup_exit(1);
 
   arena_off(&cc1_arena);
 
@@ -434,9 +555,10 @@ MIR_module_t slimcc_compile(MIR_context_t ctx, const char *name, const char *sou
   MIR_finish(scratch);
   compile_active = false;
 
+  diag_end();
   fclose(slimcc_diag_file);
   slimcc_diag_file = NULL;
-  free(diag_buf); // warnings only; surfaced via a callback in a later version
+  free(diag_buf); // warnings only, already delivered through opt->diag
   diag_buf = NULL;
   // Free this compile's per-compile state now rather than retaining it until
   // the next compile. The finished module lives in the caller's ctx and shares

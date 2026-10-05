@@ -63,7 +63,15 @@ A regression is a *change* against these lists, not membership in them.
 
 ## Patch-set discipline
 
-Keep diffs out of `codegen.c`/`parse.c`/`main.c`/`type.c`. Embedding hooks in `tokenize.c`/`preprocess.c`/`parse.c` resets are small and append-biased (~200 changed lines total in churning files). Every backend switch over node kinds ends in `default: error_tok(...)` so upstream AST additions fail loudly. After any change, `make test` (stock binary) must stay green — it proves the patch set doesn't disturb the normal compiler.
+Keep diffs out of `codegen.c`/`parse.c`/`main.c`/`type.c`. The one deliberate exception is `type.c`'s `assign_cast` (the single choke point for assignment, initialization, `return` and argument conversions), which carries the `-W` pointer/int conversion checks (`chk_ptr_assign`, ~25 lines, marked `[libslimcc]`); expect to carry it through rebases. Embedding hooks in `tokenize.c`/`preprocess.c`/`parse.c` resets are small and append-biased (~200 changed lines total in churning files). Every backend switch over node kinds ends in `default: error_tok(...)` so upstream AST additions fail loudly. After any change, `make test` (stock binary) must stay green — it proves the patch set doesn't disturb the normal compiler.
+
+## Diagnostics and warnings (`slimcc_options.diag`, `warn_flags`)
+
+Every error, warning and note reaches `slimcc_options.diag` as a `slimcc_diag` record: severity, message, the `-W` option behind a warning, the presented location (after `#line` mapping, e.g. the `.re` source of a generated lexer) and the physical one, and a pointer to the **whole resolved text** the diagnostic is in (an in-memory code part after filtering, a generated file, a header) with the token's offset/length, whether or not it exists on disk. Pointers are valid only during the call. The text form still goes to `errmsg`.
+
+Plumbing: one hook (`slimcc_diag_hook`) in `tokenize.c`'s `verror_at`/`error`, fed the severity/option/token by the entry points (`error_tok` = error, `warn_tok`/`warn_opt_tok` = warning, `notice_tok` = note; they set and restore `diag_severity`/`diag_option`, so direct `verror_at_tok` callers count as errors). `libslimcc.c`'s `lib_diag_hook` builds the public record, names the identifier for terse errors ("undefined variable 'y'") and gives `#error`/`#warning` their text as the message.
+
+Warnings: `WarnKind`/`warn_enabled[]`/`warn_names[]` (slimcc.h, tokenize.c), set per compile from gcc-style `warn_flags` (`-Wall`, `-W<name>`, `-Wno-<name>`, `-Werror`); all off in the CLI, so stock behaviour is unchanged. Implemented: `incompatible-pointer-types` (pointee types differ other than in integer signedness; `void*` exempt), `discarded-qualifiers`, `int-conversion` (pointer to non-bool integer) — all in `type.c`'s `chk_ptr_assign` — and `return-type` (codegen-mir's conservative fall-off-the-end walk: endless loops without a break, noreturn calls, `__builtin_unreachable`, `goto` all end paths; labels/cases make code reachable again). In library mode warnings never abort the parse: `-Werror` fails the compile after codegen, so every warning is reported (as tcc did). jitc always passes `-Wall -Werror` (its 0.7 libtcc behaviour: any diagnostic was fatal) and builds its `JITC COMPILE` errorCode straight from the records.
 
 ## Precompiled preamble (pch) header cache
 

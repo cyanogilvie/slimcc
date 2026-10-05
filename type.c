@@ -651,19 +651,43 @@ Type *vla_of(Type *base, Node *len, int64_t arr_len) {
   return ty;
 }
 
+// [libslimcc] The -W checks on pointer conversions in assignment, as gcc's
+// defaults (and tcc's): pointee types that differ other than in the signedness
+// of an integer type, or that lose a const/volatile qualifier.
+static void chk_ptr_assign(Type *to_ty, Node *expr) {
+  if (to_ty->kind != TY_PTR || expr->ty->kind != TY_PTR)
+    return;
+  Type *to = to_ty->base, *from = expr->ty->base;
+  if (to->kind != TY_VOID && from->kind != TY_VOID && !is_compatible(to, from) &&
+      !(is_integer(to) && is_integer(from) && to->kind == from->kind && to->size == from->size)) {
+    warn_opt_tok(WARN_INCOMPATIBLE_POINTER_TYPES, expr->tok,
+                 "assignment from incompatible pointer type");
+    return;
+  }
+  if ((get_elem(from)->qual & ~get_elem(to)->qual) & (Q_CONST | Q_VOLATILE))
+    warn_opt_tok(WARN_DISCARDED_QUALIFIERS, expr->tok,
+                 "assignment discards qualifiers from pointer target type");
+}
+
 Node *assign_cast(Type *to_ty, Node *expr) {
   add_type(expr);
 
   if (is_ptr(to_ty)) {
     ptr_convert(&expr);
-    if (is_ptr(expr->ty))
+    if (is_ptr(expr->ty)) {
+      chk_ptr_assign(to_ty, expr);
       return expr;
+    }
     if (is_null_ptr_constant(expr))
       return new_cast(expr, to_ty);
   } else if (is_compatible(to_ty, expr->ty)) {
     if (to_ty->kind != TY_VOID && to_ty->size >= 0)
       return expr;
   } else if (is_numeric(to_ty)) {
+    if (to_ty->kind != TY_BOOL &&
+        (expr->ty->kind == TY_PTR || expr->ty->kind == TY_ARRAY || expr->ty->kind == TY_FUNC))
+      warn_opt_tok(WARN_INT_CONVERSION, expr->tok,
+                   "assignment makes integer from pointer without a cast");
     return new_cast(expr, to_ty);
   }
   error_tok(expr->tok, "invalid assignment");

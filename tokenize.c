@@ -34,6 +34,32 @@ FILE *slimcc_diag_file;
 
 #define errf() (slimcc_diag_file ? slimcc_diag_file : stderr)
 
+void (*slimcc_diag_hook)(int severity, const char *option, Token *tok,
+                         const char *filename, const char *input, int line_no,
+                         const char *loc, const char *msg);
+
+bool warn_enabled[WARN_COUNT];
+const char *const warn_names[WARN_COUNT] = {
+  [WARN_INCOMPATIBLE_POINTER_TYPES] = "incompatible-pointer-types",
+  [WARN_DISCARDED_QUALIFIERS] = "discarded-qualifiers",
+  [WARN_INT_CONVERSION] = "int-conversion",
+  [WARN_RETURN_TYPE] = "return-type",
+};
+
+// The severity, enabling option and token of the diagnostic being reported,
+// for slimcc_diag_hook. Warning and note entry points set these for one
+// diagnostic and restore the defaults (an error) afterwards.
+static int diag_severity;
+static const char *diag_option;
+static Token *diag_tok;
+
+static void diag_hook_call(const char *filename, const char *input, int line_no,
+                           const char *loc, const char *fmt, va_list ap) {
+  char buf[1024];
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  slimcc_diag_hook(diag_severity, diag_option, diag_tok, filename, input, line_no, loc, buf);
+}
+
 // In library mode tokens come from a pool released wholesale between
 // compilations: token ownership is split between the allocation chain,
 // the freelist, and the surviving stream, so individual frees cannot
@@ -79,6 +105,13 @@ void tok_free(Token *t) {
 void error(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
+  if (slimcc_diag_hook) {
+    va_list ap2;
+    va_copy(ap2, ap);
+    diag_tok = NULL;
+    diag_hook_call(NULL, NULL, 0, NULL, fmt, ap2);
+    va_end(ap2);
+  }
   vfprintf(errf(), fmt, ap);
   va_end(ap);
   fprintf(errf(), "\n");
@@ -91,6 +124,13 @@ void error_ice(const char *file, int32_t line) {
 
 static void verror_at(const char *filename, const char *input, int line_no,
                       const char *loc, const char *fmt, va_list ap) {
+  if (slimcc_diag_hook) {
+    va_list ap2;
+    va_copy(ap2, ap);
+    diag_hook_call(filename, input, line_no, loc, fmt, ap2);
+    va_end(ap2);
+  }
+
   // Find a line containing `loc`.
   const char *line = loc;
   while (input < line && line[-1] != '\n')
@@ -114,6 +154,7 @@ static void verror_at(const char *filename, const char *input, int line_no,
 }
 
 void verror_at_tok(Token *tok, const char *fmt, va_list ap) {
+  diag_tok = tok;
   if (tok->file->is_placeholder) {
     verror_at(tok->file->name, tok->loc, 1, tok->loc, fmt, ap);
   } else {
@@ -137,6 +178,7 @@ void error_at(const char *loc, const char *fmt, ...) {
 
   va_list ap;
   va_start(ap, fmt);
+  diag_tok = NULL;
   verror_at(current_file->name, current_file->contents, line_no, loc, fmt, ap);
   va_end(ap);
   cleanup_exit(1);
@@ -153,7 +195,25 @@ void error_tok(Token *tok, const char *fmt, ...) {
 void warn_tok(Token *tok, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
+  diag_severity = 1;
   verror_at_tok(tok, fmt, ap);
+  diag_severity = 0;
+  va_end(ap);
+  if (opt_werror)
+    cleanup_exit(1);
+}
+
+// A warning controlled by a -W option (see warn_enabled).
+void warn_opt_tok(WarnKind w, Token *tok, const char *fmt, ...) {
+  if (!warn_enabled[w])
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  diag_severity = 1;
+  diag_option = warn_names[w];
+  verror_at_tok(tok, fmt, ap);
+  diag_severity = 0;
+  diag_option = NULL;
   va_end(ap);
   if (opt_werror)
     cleanup_exit(1);
@@ -162,7 +222,13 @@ void warn_tok(Token *tok, const char *fmt, ...) {
 void notice_tok(Token *tok, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
+  int sev = diag_severity;
+  const char *opt = diag_option;
+  diag_severity = 2;
+  diag_option = NULL;
   verror_at_tok(tok, fmt, ap);
+  diag_severity = sev;
+  diag_option = opt;
   va_end(ap);
 }
 

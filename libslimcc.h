@@ -24,6 +24,47 @@ typedef struct slimcc_vfile {
   const char *contents; // NUL-terminated; must outlive all compilations
 } slimcc_vfile;
 
+// --- Diagnostics ---------------------------------------------------------
+//
+// Every error, warning and note is delivered to slimcc_options.diag as it is
+// reported, as a structured record that carries the text it refers to: the
+// whole resolved source of the file containing it (an in-memory code part
+// after any filtering, a generated file, a header ...), whether or not that
+// ever existed on disk, so a caller can present the context however it likes.
+typedef enum {
+  SLIMCC_DIAG_ERROR,
+  SLIMCC_DIAG_WARNING,
+  SLIMCC_DIAG_NOTE, // more about the preceding diagnostic (e.g. a macro expansion)
+} slimcc_diag_severity;
+
+typedef struct slimcc_diag {
+  slimcc_diag_severity severity;
+  const char *message; // the message alone, without location
+  const char *option;  // warnings: the flag that enabled it ("-Wreturn-type"), else NULL
+
+  // Where it is reported, as a compiler would present it: after #line mapping
+  // (e.g. the .re source a generated lexer came from). NULL and 0 if the
+  // diagnostic has no source location.
+  const char *file;
+  int line;
+
+  // The text it refers to, as the compiler saw it: src (src_len bytes, NUL
+  // terminated) is the full resolved text named src_name, which differs from
+  // file when #line mapped it. The diagnosed token is at byte offset offset
+  // (length bytes; 0 if unknown), on line src_line, at byte column column (both
+  // 1-based). src is NULL if the diagnostic has no source location.
+  const char *src_name;
+  const char *src;
+  size_t src_len;
+  int src_line;
+  int column;
+  size_t offset;
+  size_t length;
+} slimcc_diag;
+
+// All pointers in diag are valid only for the duration of the call.
+typedef void slimcc_diag_fn(void *cdata, const slimcc_diag *diag);
+
 typedef struct slimcc_options {
   const char **include_paths; // -I equivalents
   int n_include_paths;
@@ -41,6 +82,19 @@ typedef struct slimcc_options {
   // Without it, debug keeps every local in a stack slot (pair with
   // MIR_set_spill_all for full variable inspection at -O0).
   int debug_optimized;
+  // Diagnostics callback (see slimcc_diag), called in addition to collecting
+  // the text form returned through errmsg. A compile stops at its first error;
+  // warnings don't stop it, so all of them are reported.
+  slimcc_diag_fn *diag;
+  void *diag_cdata;
+  // gcc-style warning flags, applied in order: "-Wall", "-W<name>",
+  // "-Wno-<name>", "-Werror" (any warning fails the compile, after all are
+  // reported) and "-Wno-error". Unknown flags are ignored. Implemented, all
+  // in -Wall: incompatible-pointer-types, discarded-qualifiers, int-conversion
+  // and return-type. None are on by default. A few warnings are unconditional,
+  // as upstream (#warning, extra tokens after a directive).
+  const char *const *warn_flags;
+  int n_warn_flags;
 } slimcc_options;
 
 // Compile one translation unit from memory. On success returns a finished,

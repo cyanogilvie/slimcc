@@ -2313,7 +2313,122 @@ void prepare_inline_asm(Node *node) {
   error_tok(node->tok, "inline assembly is not supported by the MIR backend");
 }
 
+// -Wreturn-type: can control reach the end of a non-void function? A
+// conservative reachability walk over the statement tree: when unsure (a label
+// that a goto may target, a loop condition that isn't constant), it assumes
+// the end is reachable only where that's the plain reading of the code, so
+// that it doesn't flag functions that end in an endless loop, a noreturn call
+// or __builtin_unreachable.
+static bool breaks_to(Node *n, Node *target) {
+  if (!n)
+    return false;
+  switch (n->kind) {
+  case ND_BREAK:
+    return n->jmp.parent_loop == target;
+  case ND_BLOCK:
+    for (Node *s = n->blk.body; s; s = s->next)
+      if (breaks_to(s, target))
+        return true;
+    return false;
+  case ND_IF:
+    return breaks_to(n->ctrl.then, target) || breaks_to(n->ctrl.els, target);
+  case ND_FOR:
+  case ND_DO:
+  case ND_SWITCH:
+    return breaks_to(n->ctrl.then, target); // a nested break targets the inner one
+  default:
+    return false;
+  }
+}
+
+static bool continues_to(Node *n, Node *target) {
+  if (!n)
+    return false;
+  switch (n->kind) {
+  case ND_CONT:
+    return n->jmp.parent_loop == target;
+  case ND_BLOCK:
+    for (Node *s = n->blk.body; s; s = s->next)
+      if (continues_to(s, target))
+        return true;
+    return false;
+  case ND_IF:
+    return continues_to(n->ctrl.then, target) || continues_to(n->ctrl.els, target);
+  case ND_FOR:
+  case ND_DO:
+  case ND_SWITCH:
+    return continues_to(n->ctrl.then, target);
+  default:
+    return false;
+  }
+}
+
+static bool cond_always_true(Node *cond) {
+  int64_t val;
+  return !cond || (is_const_expr(cond, &val) && val);
+}
+
+static bool stmt_falls_through(Node *n) {
+  switch (n->kind) {
+  case ND_RETURN:
+  case ND_GOTO:
+  case ND_GOTO_EXPR:
+  case ND_BREAK:
+  case ND_CONT:
+    return false;
+  case ND_BLOCK: {
+    bool reach = true;
+    for (Node *s = n->blk.body; s; s = s->next) {
+      if (s->kind == ND_LABEL || s->kind == ND_CASE || s->kind == ND_DEFAULT)
+        reach = true;
+      else if (reach)
+        reach = stmt_falls_through(s);
+    }
+    return reach;
+  }
+  case ND_IF:
+    return !n->ctrl.els || stmt_falls_through(n->ctrl.then) || stmt_falls_through(n->ctrl.els);
+  case ND_FOR:
+    return !cond_always_true(n->ctrl.cond) || breaks_to(n->ctrl.then, n);
+  case ND_DO:
+    if (breaks_to(n->ctrl.then, n))
+      return true;
+    if (cond_always_true(n->ctrl.cond))
+      return false;
+    return stmt_falls_through(n->ctrl.then) || continues_to(n->ctrl.then, n);
+  case ND_SWITCH:
+    return !n->ctrl.sw_default || breaks_to(n->ctrl.then, n) || stmt_falls_through(n->ctrl.then);
+  case ND_EXPR_STMT: {
+    Node *e = n->m.lhs;
+    while (e && e->kind == ND_CAST)
+      e = e->m.lhs;
+    if (!e)
+      return true;
+    if (e->kind == ND_UNREACHABLE)
+      return false;
+    if (e->kind == ND_FUNCALL && e->call.expr && e->call.expr->kind == ND_VAR &&
+        e->call.expr->m.var->is_noreturn)
+      return false;
+    return true;
+  }
+  default:
+    return true;
+  }
+}
+
+static void chk_return_type(Obj *fn) {
+  if (!warn_enabled[WARN_RETURN_TYPE] || !fn->body || fn->ty->return_ty->kind == TY_VOID ||
+      fn->is_noreturn || !strcmp(fn->name, "main") || !stmt_falls_through(fn->body))
+    return;
+  Node *last = NULL;
+  for (Node *s = fn->body->blk.body; s; s = s->next)
+    last = s;
+  warn_opt_tok(WARN_RETURN_TYPE, last && last->tok ? last->tok : fn->body->tok,
+               "control reaches end of non-void function '%s'", fn->name);
+}
+
 void emit_text(Obj *fn) {
+  chk_return_type(fn);
   if (fn->is_naked)
     error("naked functions are not supported by the MIR backend");
   if (fn->alias_name)
