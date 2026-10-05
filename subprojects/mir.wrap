@@ -1,6 +1,10 @@
+# MIR fork (cyanogilvie/mir), pinned to a commit on its debug-support branch so
+# builds are reproducible. To move it: push to the fork, update the SHA here,
+# then `meson subprojects update --reset mir`. A superproject's own top-level
+# mir.wrap takes precedence over this one.
 [wrap-git]
 url = https://github.com/cyanogilvie/mir.git
-revision = debug-support
+revision = bf72acee4fa95f5327568b2dff74cde8c31e7f22
 depth = 1
 
 [provide]
