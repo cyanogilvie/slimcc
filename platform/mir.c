@@ -33,6 +33,12 @@ void platform_init_cc1(void) {
 
   define_macro("__slimcc_mir__", "1");
 
+  // GNU's __extension__ only suppresses pedantic diagnostics for the
+  // declaration or expression that follows, so it is a no-op here. Headers use
+  // it at file scope (Alpine's fortify-headers wrap every libc header in
+  // `__extension__ #include_next <...>`), which slimcc would otherwise reject.
+  define_macro("__extension__", "");
+
   init_ty_lp64();
 
 #if defined(__aarch64__)
