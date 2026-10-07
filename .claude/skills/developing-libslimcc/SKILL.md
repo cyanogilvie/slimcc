@@ -44,6 +44,8 @@ make slimcc-mir-run        # JIT test driver
 
 Suite sweep: loop that command over `test/*.c`; pass = exit 0.
 
+Host-ABI interop (aggregates by value, JIT <-> host-compiled code, both directions, register exhaustion, varargs): `scripts/test_mir_abi.sh [hostcc]` after `make slimcc-mir-run`. It generates the cases from `test/mir-abi/gen.py`, builds the host half as a shared library with the host compiler and preloads it into `slimcc-mir-run`. Must pass in full on both target arches (x86_64 can run under qemu-user in an amd64 container).
+
 **Meson** (subproject-wrap consumption; library only — the CLI compiler stays Makefile-built):
 
 ```sh
@@ -109,4 +111,4 @@ Validate with `readelf --debug-dump=info,decodedline` on the emitted object and 
 
 ## Status & next steps
 
-Workstream A (this repo) is feature-complete and validated on both target arches. Next phases: Workstream B = tclmir (Tcl stubs package wrapping MIR, meson TEA, per-interp `MIR_context_t` via AssocData); Workstream C = cmark/xpath libjit→MIR migration + jitc consuming `slimcc_compile`. Deferred: per-target BLK classification for host-ABI struct interop (aarch64 HFA gap — fine MIR↔MIR, wrong for host by-value HFA calls).
+Workstream A (this repo) is feature-complete and validated on both target arches. Next phases: Workstream B = tclmir (Tcl stubs package wrapping MIR, meson TEA, per-interp `MIR_context_t` via AssocData); Workstream C = cmark/xpath libjit→MIR migration + jitc consuming `slimcc_compile`. Host-ABI aggregate classification (struct returns in registers, x86-64 eightbyte classes, aarch64 HFAs) landed 2026-10-06 — see backend-invariants.md "Host calling convention for aggregates".

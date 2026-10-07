@@ -33,6 +33,10 @@ Type *ty_char16_t;
 Type *ty_char32_t;
 Type *ty_wchar_t;
 
+// [libslimcc] Set by the target platform: _BitInt(N > 64) layout in 128-bit
+// chunks (AAPCS64) rather than 64-bit ones (x86-64).
+bool bitint_chunk128;
+
 Type *enum_ty[8];
 EnumType ety_of_int;
 
@@ -110,6 +114,8 @@ Type *new_bitint(int64_t width, Token *tok) {
     sz = align = 4;
   else if (width <= 64)
     sz = align = 8;
+  else if (bitint_chunk128) // [libslimcc] AAPCS64: 128-bit chunks, 16-byte aligned
+    sz = align_to(width, 128) / 8, align = 16;
   else
     sz = align_to(width, 64) / 8, align = 8; // ARM64 align to 16
 

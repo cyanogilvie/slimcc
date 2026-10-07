@@ -49,6 +49,8 @@ void platform_init_cc1(void) {
   define_macro("__CHAR_UNSIGNED__", "1");
   ty_wchar_t = ty_uint;
   define_macro("__WCHAR_TYPE__", "unsigned int");
+  // AAPCS64 lays out _BitInt(N > 64) as 16-byte aligned 128-bit chunks.
+  bitint_chunk128 = true;
 #endif
 }
 

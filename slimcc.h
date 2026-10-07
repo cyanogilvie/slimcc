@@ -1078,6 +1078,7 @@ extern Type *ty_eval_int;
 extern Type *ty_char16_t;
 extern Type *ty_char32_t;
 extern Type *ty_wchar_t;
+extern bool bitint_chunk128;
 
 extern Type *enum_ty[8];
 extern EnumType ety_of_int;
