@@ -1393,18 +1393,16 @@ static MIR_reg_t store_bitint_bitfield(Member *mem, MIR_reg_t addr, MIR_reg_t va
 // themselves. Calls into or out of host-compiled code need the target ABI's
 // classification on top, which c2mir does in its <target>-ABI-code.c:
 // - small aggregate returns come back in registers, as several MIR results;
-// - x86-64 aggregate args travel per their eightbyte classes (BLK + n);
-// - aarch64 homogeneous floating-point aggregates (HFAs) travel in FP
-//   registers, as one scalar MIR argument per member.
+// - x86-64 aggregate args travel per their eightbyte classes (BLK + 1..4),
+//   and in memory if any member is misaligned (packed structs);
+// - aarch64 homogeneous floating-point aggregates (HFAs) travel as MIR's
+//   HFA blocks (BLK + 1..3), in FP registers or on the stack, named or
+//   variadic;
+// - 16-byte aligned arguments start at an even GPR (aarch64) or a 16-byte
+//   stack boundary (x86-64), via padding args MIR's layout then places:
+//   MIR blocks carry no alignment.
 // Big _BitInts follow the aggregate rules here (they are values-by-address
 // in this backend), classified as integer chunks.
-//
-// - 16-byte aligned arguments start at an even GPR (aarch64) or a 16-byte
-//   stack boundary (x86-64), via padding args MIR's layout then places.
-//
-// Not covered: aarch64 HFAs in variadic positions stay BLKs (MIR's va_arg
-// can't fetch them from the FP save area, so splitting them would break
-// JIT-to-JIT varargs).
 //
 
 #define AGG_MAX_PARTS 4
@@ -1446,6 +1444,8 @@ static AggClass agg_merge_class(AggClass a, AggClass b) {
   return AC_SSE;
 }
 
+// A field at an offset that isn't a multiple of its type's alignment (in a
+// packed struct) makes the whole aggregate MEMORY, as gcc and clang do.
 static AggClass agg_class(Type *ty, int64_t lo, int64_t hi, int64_t offset, AggClass ac) {
   if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
     for (Member *mem = ty->members; mem_iter(&mem); mem = mem->next) {
@@ -1454,6 +1454,8 @@ static AggClass agg_class(Type *ty, int64_t lo, int64_t hi, int64_t offset, AggC
         continue;
       if (ofs >= hi)
         break;
+      if (!mem->is_bitfield && mem->ty->align > 1 && ofs % mem->ty->align)
+        return AC_MEM;
       ac = agg_class(mem->ty, lo, hi, ofs, ac);
     }
     return ac;
@@ -1596,10 +1598,6 @@ static void va_arg_align(Type *ty, MIR_reg_t ap) {
   out(MIR_new_insn(mc, MIR_MOV, overflow, rop(area)));
 }
 
-static bool hfa_split_arg(Type *ty, bool variadic, ArgRegs *ar, AggParts *p, int *npad) {
-  return false;
-}
-
 #elif defined(__aarch64__)
 
 // Homogeneous floating-point aggregate (AAPCS64 5.9.5): 1-4 members, all
@@ -1673,12 +1671,24 @@ static bool agg_ret_regs(Type *ty, AggParts *p) {
 // Padding args are integers: they skip a GPR.
 #define PAD_ARG_TYPE MIR_T_I64
 
-// Non-HFA aggregates: MIR's BLK matches AAPCS64 (<= 16 bytes in integer
-// registers or on the stack, larger ones by reference), except that a
-// 16-byte aligned one starts at an even register: *npad padding integer
-// args skip an odd one.
+// MIR's HFA block for float, double or long double members (mir-aarch64.h):
+// passed in FP registers, or on the stack in memory layout.
+static MIR_type_t hfa_blk_type(Type *base) {
+  return base->kind == TY_FLOAT ? MIR_T_BLK + 1 : base->kind == TY_DOUBLE ? MIR_T_BLK + 2 : MIR_T_BLK + 3;
+}
+
+// HFAs travel as MIR's HFA blocks. Other aggregates: MIR's BLK matches
+// AAPCS64 (<= 16 bytes in integer registers or on the stack, larger ones by
+// reference), except that a 16-byte aligned one starts at an even register:
+// *npad padding integer args skip an odd one.
 static MIR_type_t agg_arg_blk_type(Type *ty, ArgRegs *ar, int *npad) {
+  Type *base;
+  int n = hfa_count(ty, &base);
   *npad = 0;
+  if (n) {
+    ar->fregs = ar->fregs + n <= 8 ? ar->fregs + n : 8;
+    return hfa_blk_type(base);
+  }
   if (ty->size > 16) {
     ar->iregs = MIN(ar->iregs + 1, 8);
     return MIR_T_BLK;
@@ -1693,7 +1703,8 @@ static MIR_type_t agg_arg_blk_type(Type *ty, ArgRegs *ar, int *npad) {
 }
 
 static MIR_type_t agg_va_blk_type(Type *ty) {
-  return MIR_T_BLK;
+  Type *base;
+  return hfa_count(ty, &base) ? hfa_blk_type(base) : MIR_T_BLK;
 }
 
 static int scalar_arg_regs(Type *ty, ArgRegs *ar) {
@@ -1706,12 +1717,13 @@ static int scalar_arg_regs(Type *ty, ArgRegs *ar) {
 
 static void rblk_arg_regs(ArgRegs *ar) {}
 
-// va_arg of a 16-byte aligned aggregate (<= 16 bytes; larger ones are
-// passed by reference): round __gr_offs up to an even register, or __stack
-// up to 16 bytes when it comes from the stack, as AAPCS64 places it -
-// MIR's va_block_arg doesn't.
+// va_arg of a 16-byte aligned aggregate in integer registers (<= 16 bytes;
+// larger ones are passed by reference; HFAs are MIR's): round __gr_offs up
+// to an even register, or __stack up to 16 bytes when it comes from the
+// stack, as AAPCS64 places it - MIR's va_block_arg doesn't.
 static void va_arg_align(Type *ty, MIR_reg_t ap) {
-  if (!is_agg_value(ty) || ty->align < 16 || ty->size > 16)
+  Type *base;
+  if (!is_agg_value(ty) || ty->align < 16 || ty->size > 16 || hfa_count(ty, &base))
     return;
   MIR_label_t on_stack = MIR_new_label(mc), done = MIR_new_label(mc);
   MIR_reg_t off = new_tmp(MIR_T_I64), end = new_tmp(MIR_T_I64), sp = new_tmp(MIR_T_I64);
@@ -1730,38 +1742,6 @@ static void va_arg_align(Type *ty, MIR_reg_t ap) {
   out(MIR_new_insn(mc, MIR_AND, rop(sp), rop(sp), iop(-16)));
   out(MIR_new_insn(mc, MIR_MOV, stack, rop(sp)));
   out_lab(done);
-}
-
-// A named HFA argument goes in consecutive FP registers, one MIR scalar
-// argument per member. If they don't all fit, AAPCS64 gives up the
-// remaining FP registers and copies the HFA to the stack in its memory
-// layout: burn the leftovers with *npad padding doubles, then pass the
-// members as 8-byte stack slots, float pairs packed into one double.
-static bool hfa_split_arg(Type *ty, bool variadic, ArgRegs *ar, AggParts *p, int *npad) {
-  Type *base;
-  int n = hfa_count(ty, &base);
-  if (!n || variadic)
-    return false;
-  p->n = 0;
-  *npad = 0;
-  if (ar->fregs + n <= 8) {
-    for (int i = 0; i < n; i++) {
-      p->type[i] = mir_type(base);
-      p->offset[i] = i * base->size;
-    }
-    p->n = n;
-    ar->fregs += n;
-    return true;
-  }
-  *npad = 8 - ar->fregs;
-  ar->fregs = 8;
-  for (int64_t ofs = 0; ofs < ty->size; ofs += MAX(base->size, 8)) {
-    p->type[p->n] = base->kind == TY_FLOAT && ty->size - ofs <= 4 ? MIR_T_F
-                    : base->kind == TY_LDOUBLE                   ? MIR_T_LD
-                                                                 : MIR_T_D;
-    p->offset[p->n++] = ofs;
-  }
-  return true;
 }
 
 #else
@@ -1789,10 +1769,6 @@ static int scalar_arg_regs(Type *ty, ArgRegs *ar) {
 static void rblk_arg_regs(ArgRegs *ar) {}
 
 static void va_arg_align(Type *ty, MIR_reg_t ap) {}
-
-static bool hfa_split_arg(Type *ty, bool variadic, ArgRegs *ar, AggParts *p, int *npad) {
-  return false;
-}
 
 #endif
 
@@ -1921,18 +1897,11 @@ static MIR_reg_t gen_funcall(Node *node) {
     fn_op = rop(gen_expr(fn_expr));
   }
 
-  // Arguments past the named parameters are variadic.
-  int nnamed = 0;
-  if (fn_ty->is_variadic)
-    for (Obj *p = fn_ty->param_list; p; p = p->param_next)
-      nnamed++;
-
-  // Each aggregate can expand to a padding arg plus up to 4 member args
-  // (hfa_split_arg, agg_arg_blk_type), a scalar to a padding arg plus
-  // itself, and a call burns at most 8 FP registers with padding.
-  int maxargs = rtn_by_addr + 8;
+  // Any argument can take a padding arg first (agg_arg_blk_type,
+  // scalar_arg_regs).
+  int maxargs = rtn_by_addr;
   for (Obj *arg = node->call.args; arg; arg = arg->param_next)
-    maxargs += is_agg_value(arg->ty) ? 5 : 2;
+    maxargs += 2;
 
   MIR_var_t *vars = arena_malloc(&cc1_arena, maxargs * sizeof(MIR_var_t));
   MIR_op_t *argops = arena_malloc(&cc1_arena, maxargs * sizeof(MIR_op_t));
@@ -1949,29 +1918,13 @@ static MIR_reg_t gen_funcall(Node *node) {
   }
 
   // Evaluate arguments left to right.
-  int argno = 0;
-  for (Obj *arg = node->call.args; arg; arg = arg->param_next, argno++) {
+  for (Obj *arg = node->call.args; arg; arg = arg->param_next) {
     Type *ty = arg->ty;
     if (is_agg_value(ty)) {
-      // Aggregate values are their address. A split HFA passes its members
-      // (after any padding); otherwise MIR copies the block per its type.
-      // The mem op's disp field carries the size.
+      // Aggregate values are their address; MIR copies the block per its
+      // type (agg_arg_blk_type). The mem op's disp field carries the size.
       MIR_reg_t addr = gen_expr(arg->arg_expr);
-      bool variadic = fn_ty->is_variadic && argno >= nnamed;
-      AggParts p;
       int npad;
-      if (hfa_split_arg(ty, variadic, &ar, &p, &npad)) {
-        for (int k = 0; k < npad; k++, nargs++) {
-          vars[nargs] = (MIR_var_t){.type = MIR_T_D, .name = arena_format(&cc1_arena, "a%d", nargs)};
-          MIR_reg_t z = new_tmp(MIR_T_D);
-          out(MIR_new_insn(mc, MIR_DMOV, rop(z), MIR_new_double_op(mc, 0.0)));
-          argops[nargs] = rop(z);
-        }
-        load_parts(&p, ty->size, addr, argops + nargs);
-        for (int k = 0; k < p.n; k++, nargs++)
-          vars[nargs] = (MIR_var_t){.type = p.type[k], .name = arena_format(&cc1_arena, "a%d", nargs)};
-        continue;
-      }
       MIR_type_t blk = agg_arg_blk_type(ty, &ar, &npad);
       for (int k = 0; k < npad; k++, nargs++) {
         vars[nargs] = pad_arg_var(arena_format(&cc1_arena, "a%d", nargs));
@@ -3017,23 +2970,21 @@ void emit_text(Obj *fn) {
   reg_names = (HashMap){0};
 
   // Signature, the mirror image of gen_funcall's: aggregates and big
-  // bitints travel as MIR block args (or split into members, see
-  // hfa_split_arg); their returns come back in the host ABI's result
-  // registers (agg_ret_regs) or through a hidden first RBLK argument
-  // carrying the caller's buffer.
+  // bitints travel as MIR block args (agg_arg_blk_type); their returns come
+  // back in the host ABI's result registers (agg_ret_regs) or through a
+  // hidden first RBLK argument carrying the caller's buffer.
   bool agg_ret = is_agg_value(rt);
   ret_in_regs = agg_ret && agg_ret_regs(rt, &ret_parts);
   bool rtn_by_addr = agg_ret && !ret_in_regs;
 
   // Bounds as in gen_funcall.
-  int maxargs = rtn_by_addr + 8, nparams = 0;
+  int maxargs = rtn_by_addr, nparams = 0;
   for (Obj *p = fn->ty->param_list; p; p = p->param_next, nparams++)
-    maxargs += is_agg_value(p->ty) ? 5 : 2;
+    maxargs += 2;
 
-  MIR_var_t *vars = arena_malloc(&cc1_arena, maxargs * sizeof(MIR_var_t));
-  // Per parameter: its first MIR arg, and the member parts of a split HFA.
+  MIR_var_t *vars = arena_malloc(&cc1_arena, MAX(maxargs, 1) * sizeof(MIR_var_t));
+  // Per parameter: its MIR arg, after any padding.
   int *param_arg = arena_malloc(&cc1_arena, MAX(nparams, 1) * sizeof(int));
-  AggParts **param_parts = arena_calloc(&cc1_arena, MAX(nparams, 1) * sizeof(AggParts *));
 
   ArgRegs ar = {0};
   int nargs = 0;
@@ -3046,18 +2997,6 @@ void emit_text(Obj *fn) {
   }
   int pi = 0;
   for (Obj *p = fn->ty->param_list; p; p = p->param_next, pi++) {
-    AggParts parts;
-    int npad;
-    if (is_agg_value(p->ty) && hfa_split_arg(p->ty, false, &ar, &parts, &npad)) {
-      for (int k = 0; k < npad; k++, nargs++)
-        vars[nargs] = (MIR_var_t){.type = MIR_T_D, .name = arena_format(&cc1_arena, "A%d", nargs)};
-      param_arg[pi] = nargs;
-      param_parts[pi] = arena_malloc(&cc1_arena, sizeof(AggParts));
-      *param_parts[pi] = parts;
-      for (int k = 0; k < parts.n; k++, nargs++)
-        vars[nargs] = (MIR_var_t){.type = parts.type[k], .name = arena_format(&cc1_arena, "A%d", nargs)};
-      continue;
-    }
     if (is_agg_value(p->ty)) {
       int npad;
       MIR_type_t blk = agg_arg_blk_type(p->ty, &ar, &npad);
@@ -3135,15 +3074,7 @@ void emit_text(Obj *fn) {
 
   pi = 0;
   for (Obj *p = fn->ty->param_list; p; p = p->param_next, pi++) {
-    int i = param_arg[pi];
-    if (param_parts[pi]) {
-      MIR_op_t ops[AGG_MAX_PARTS];
-      for (int k = 0; k < param_parts[pi]->n; k++)
-        ops[k] = rop(MIR_reg(mc, vars[i + k].name, fn_func));
-      store_parts(param_parts[pi], p->ty->size, local_addr(p), ops);
-      continue;
-    }
-    MIR_reg_t arg = MIR_reg(mc, vars[i].name, fn_func);
+    MIR_reg_t arg = MIR_reg(mc, vars[param_arg[pi]].name, fn_func);
     if (is_agg_value(p->ty))
       gen_mem_copy(local_addr(p), arg, p->ty->size);
     else if (is_reg_local(p))

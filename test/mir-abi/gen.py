@@ -24,8 +24,8 @@ def bits(name, w, signed=False):
 
 
 # (name, struct/union body, scalar members to fill and check, flags)
-# Flags: union (fill/check the first member only), hfa (an aarch64 homogeneous
-# floating-point aggregate: variadic passing is a documented gap there),
+# Flags: union (fill/check the first member only), packed (a packed struct),
+# hfa (an aarch64 homogeneous floating-point aggregate, for reference),
 # bitint (needs _BitInt support in the host compiler).
 TYPES = [
     ("C1", "char a;", [("a", "char")], ""),
@@ -68,6 +68,12 @@ TYPES = [
      bits("a", 3) + bits("b", 7) + bits("c", 12, True), ""),
     ("BF2", "unsigned long long a : 40; unsigned b : 20; char c;",
      bits("a", 40) + bits("b", 20) + [("c", "char")], ""),
+    # misaligned members: memory on x86-64; aligned packed ones aren't
+    ("P5", "char c; int i;", [("c", "char"), ("i", "int")], "packed"),
+    ("P9", "char c; double d;", [("c", "char"), ("d", "double")], "packed"),
+    ("P12", "short s; float f; char c; int i;",
+     [("s", "short"), ("f", "float"), ("c", "char"), ("i", "int")], "packed"),
+    ("PA", "int a; int b;", [("a", "int"), ("b", "int")], "packed"),
     ("B100", "_BitInt(100) a;", [("a", "bitint100")], "bitint"),
     ("B130", "_BitInt(130) a;", [("a", "bitint130")], "bitint"),
     ("B200", "_BitInt(200) a;", [("a", "bitint200")], "bitint"),
@@ -101,7 +107,8 @@ def gen_header(out, bitint):
         w("#define HAVE_BITINT 1\n")
     w("#include <stdarg.h>\n#include <string.h>\n\n")
     for name, body, members, flags in TYPES:
-        kind = "union" if "union" in flags else "struct"
+        kind = ("union" if "union" in flags
+                else "struct __attribute__((packed))" if "packed" in flags else "struct")
         guard = "bitint" in flags
         if guard:
             w("#ifdef HAVE_BITINT\n")
@@ -266,9 +273,6 @@ def gen_jit(out):
     for name, body, members, flags in TYPES:
         T = name
         guard = "bitint" in flags
-        # Variadic HFAs on aarch64 still travel as MIR BLKs (MIR's va_arg
-        # can't fetch them from the FP save area) - see codegen-mir.c.
-        va_ok = "hfa" not in flags
         if guard:
             w("#ifdef HAVE_BITINT\n")
         w(bodies(T, "j"))
@@ -304,15 +308,12 @@ static void test_{T}(int s) {{
   ck("{T}", "jit->jit va", j_va_{T}(s, 2, mk_{T}(s), mk_{T}(s + 1), 12345));
   ck("{T}", "jit->jit va odd", j_va1_{T}(s, mk_{T}(s), 777, mk_{T}(s + 1), 12345));
   ck("{T}", "jit->jit va after 6 longs", j_vam_{T}(s, 1L, 2L, 3L, 4L, 5L, 6L, mk_{T}(s), 12345));
-""")
-        w("#if 1\n" if va_ok else "#if !defined(__aarch64__)\n")
-        w(f"""  ck("{T}", "jit->host va", h_va_{T}(s, 2, mk_{T}(s), mk_{T}(s + 1), 12345));
+  ck("{T}", "jit->host va", h_va_{T}(s, 2, mk_{T}(s), mk_{T}(s + 1), 12345));
   ck("{T}", "host->jit va", h_cb_va_{T}(j_va_{T}, s));
   ck("{T}", "jit->host va odd", h_va1_{T}(s, mk_{T}(s), 777, mk_{T}(s + 1), 12345));
   ck("{T}", "host->jit va odd", h_cb_va1_{T}(j_va1_{T}, s));
   ck("{T}", "jit->host va after 6 longs", h_vam_{T}(s, 1L, 2L, 3L, 4L, 5L, 6L, mk_{T}(s), 12345));
   ck("{T}", "host->jit va after 6 longs", h_cb_vam_{T}(j_vam_{T}, s));
-#endif
 }}
 """)
         if guard:

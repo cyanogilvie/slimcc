@@ -44,59 +44,21 @@ for the host ABI, which is why codegen-mir.c does.
 
 ## Remaining gaps on the supported targets
 
-- **aarch64, HFAs in variadic positions** (all-float/double/long double
-  structs of 1-4 members, passed to a `...` parameter). AAPCS64 passes
-  them in FP registers like named ones; libslimcc passes them as MIR BLKs
-  (GPRs). MIR's `va_block_arg` can't fetch an HFA from the FP save area,
-  so splitting them at call sites would break JIT-to-JIT varargs. Fix:
-  see "Fixing variadic HFAs" below.
-- **x86_64, packed structs with misaligned members** (e.g. `struct
-  __attribute__((packed)) { char c; int i; }`). The psABI classifies any
-  aggregate with an unaligned field as MEMORY: gcc and clang pass it on
-  the stack and return it through the hidden pointer (verified
-  2026-10-07). `agg_class` classifies by member type only, so these travel
-  in registers. Fix: in `agg_class`, treat a non-bitfield member whose
-  absolute offset isn't a multiple of its type's natural alignment as
-  `AC_MEM` (a few lines), and add packed shapes to `test/mir-abi/gen.py`.
-  Packed but naturally aligned structs (`{int; int}`) stay in registers,
-  as with gcc. AAPCS64 has no such rule, so aarch64 needs no change.
-- **Empty structs as arguments**: travel as size-0 MIR BLKs. That's
+- **Empty structs as arguments** travel as size-0 MIR BLKs. That's
   consistent JIT-to-JIT, but not checked against gcc (which ignores them
   on both targets). Empty struct *returns* return nothing, matching gcc.
 
-### Fixing variadic HFAs (aarch64 Linux)
+Closed 2026-10-07 (jitc 0.8.6):
 
-Two ways:
-
-- **In libslimcc only (no MIR change).** In `ND_VA_ARG` for an HFA, emit
-  GCC's algorithm inline, like `va_arg_align` does:
-  - `offs = __vr_offs`; if `offs >= 0`, take it from the stack.
-  - `nr = offs + 16*n`; `__vr_offs = nr`; if `nr > 0`, take it from the
-    stack.
-  - Otherwise member *i* is the base type at `__vr_top + offs + 16*i`
-    (each FP register occupies a 16-byte slot).
-  - Stack: round `__stack` up to the HFA's alignment (8, or 16 for long
-    double), copy `size` bytes, advance by `size` rounded up to 8.
-
-  Then drop the `variadic` exemption in `hfa_split_arg`. On Linux,
-  variadic FP args use the same registers as named ones, and MIR's
-  aarch64 `va_start` already saves v0-v7 and fills `__vr_top`/`__vr_offs`.
-  It relies on the mir fork's `fix-gvn-va-mem-clobber` (already pinned),
-  and remove the `hfa` va skip in `gen.py`. Roughly 60 lines.
-- **In MIR, so c2mir benefits too (upstream-able).** MIR has no notion of
-  an HFA: BLK carries only a size. It would need an HFA encoding, e.g. in
-  the free `ncase` operand of `va_block_arg` for the callee side, and an
-  aarch64 BLK sub-type (base type x count) for args. Then:
-  - `mir-gen-aarch64.c` `machinize_call` and incoming-arg handling would
-    load/spill members to/from v registers or natural-layout stack.
-  - `mir-aarch64.c`'s ff_call thunk would need the same for the
-    interpreter.
-  - `va_block_arg_builtin` would implement the algorithm above.
-  - c2mir's `caarch64-ABI-code.c` would classify HFAs for args *and*
-    returns. It currently returns HFAs in x0/x1, which is the same bug
-    class jitc 0.8.0-0.8.4 had for small structs.
-
-  Several hundred lines across four files.
+- **aarch64 HFAs in variadic positions** (and named ones): MIR now has HFA
+  block cases (`MIR_T_BLK + 1..3`, mir fork branch `aarch64-hfa-blk`,
+  filed upstream). MIR passes them in FP registers or on the stack in
+  memory layout, and `va_block_arg` fetches them from the FP save area or
+  the stack, as GCC does. c2mir classifies HFAs too, for args and returns.
+- **x86-64 packed structs with misaligned members** are MEMORY class
+  (`agg_class`), as gcc and clang have them. On aarch64 these needed the
+  fork's `fix-combine-unencodable-addr`: MIR folded misaligned FP accesses
+  into unencodable scaled offsets and failed to compile them.
 
 ## Linux riscv64
 
@@ -151,15 +113,14 @@ MIR supports both macOS architectures. libslimcc needs:
     Linux. MIR's Apple `va_arg`/`va_block_arg` builtins already use the
     pointer form.
   - **All variadic arguments go on the stack** in 8-byte slots
-    (aggregates <= 16 bytes by value, larger by reference), never in
-    registers. The even-register padding in `agg_arg_blk_type` and HFA
-    splitting must not apply to variadic positions there. MIR handles
-    scalar variadic placement itself.
+    (aggregates <= 16 bytes by value, larger by reference, HFAs by value),
+    never in registers. MIR handles that, including its HFA blocks (the
+    Apple paths of `aarch64-hfa-blk` are written but untested). The
+    even-register padding in `agg_arg_blk_type` must not apply to variadic
+    positions there.
   - Named stack arguments are packed to their natural alignment, not
-    8-byte slots: a `char` takes 1 byte. `hfa_split_arg`'s stack spill
-    (8-byte slots, float pairs packed into doubles) assumes Linux and
-    would need an Apple variant. Check how MIR's machinize lays out small
-    scalar stack args on Apple.
+    8-byte slots: a `char` takes 1 byte. MIR's machinize uses 8-byte slots
+    on Apple too, which is a MIR gap for small scalar stack args.
   - x18 is reserved (MIR handles it). `_BitInt` layout: verify Apple
     clang against `bitint_chunk128`.
 - **Validation needs a Mac** (qemu-user can't run macOS binaries): run
