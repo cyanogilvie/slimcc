@@ -5,6 +5,8 @@ description: Architecture, build/test commands, suite baselines, and hard-won in
 
 # Developing libslimcc (slimcc → MIR JIT backend)
 
+**Platforms**: Linux x86_64/aarch64 only (`platform/mir.c` `#error`s elsewhere). What macOS, Windows and Linux riscv64 need, and the remaining ABI gaps on the supported targets: `notes/mir-backend/platform-support.md`.
+
 This fork of fuhsnn/slimcc (branch `mir-backend`, remote `fork` = cyanogilvie/slimcc) adds an embeddable JIT library that compiles C23+defer source into MIR modules, consumed by jitc/tclmir to replace libtcc/libjit. Production targets: aarch64+musl primary, x86_64+glibc secondary.
 
 Companion docs — read before re-deriving anything:

@@ -5,6 +5,15 @@
 // supplies include paths and/or virtual files.
 #include "slimcc.h"
 
+// The predefined macros, va_list layout, type model (LP64) and type policies
+// here, and the aggregate calling-convention classification in codegen-mir.c,
+// are those of Linux (x86-64 SysV, AAPCS64). On another OS the JIT would
+// silently compile code against the wrong ABI, so refuse to build there. See
+// notes/mir-backend/platform-support.md for what porting needs.
+#if !defined(__linux__)
+#error "libslimcc's MIR backend supports Linux hosts only - see notes/mir-backend/platform-support.md"
+#endif
+
 void platform_init_cc1(void) {
   define_macro("__ELF__", "1");
 
@@ -25,6 +34,8 @@ void platform_init_cc1(void) {
   define_macro("__ARM_ARCH", "8");
   define_macro("__ARM_ARCH_ISA_A64", "1");
 #elif defined(__riscv) && __riscv_xlen == 64
+  // Builds, but not ABI-correct yet (aggregates, va_list, char signedness):
+  // see notes/mir-backend/platform-support.md.
   define_macro("__riscv", "1");
   define_macro("__riscv_xlen", "64");
 #else
