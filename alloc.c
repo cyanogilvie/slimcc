@@ -3,9 +3,12 @@
 #define FREE_THRESHOLD (100 * 1024)
 #define ARENA_POOL_SIZE 8160
 
+// buf is ARENA_POOL_SIZE bytes, except for an oversized pool (see
+// allocate_oversized), which holds a single allocation larger than that.
 struct Pool {
-  char buf[ARENA_POOL_SIZE];
   Pool *next;
+  bool oversized;
+  _Alignas(16) char buf[];
 };
 
 Arena ast_arena;
@@ -40,14 +43,28 @@ static Pool *new_pool(void) {
     p = pool_freelist;
     pool_freelist = p->next;
   } else {
-    p = malloc(sizeof(Pool));
+    p = malloc(sizeof(Pool) + ARENA_POOL_SIZE);
   }
 
 #if defined(USE_ASAN)
   __asan_poison_memory_region(&p->buf, ARENA_POOL_SIZE);
 #endif
   p->next = NULL;
+  p->oversized = false;
   return p;
+}
+
+// An allocation too big for a pool gets a pool of its own, linked in at the
+// head of the arena's chain (leaving cur, the pool being carved, at the tail)
+// so that arena_off releases it with the rest.  These are never put on the
+// freelist: they are freed by arena_off, and arena_off frees the oversized
+// pools first.
+static void *allocate_oversized(Arena *arena, size_t aligned_sz) {
+  Pool *p = malloc(sizeof(Pool) + aligned_sz);
+  p->oversized = true;
+  p->next = arena->head;
+  arena->head = p;
+  return &p->buf;
 }
 
 static void *allocate(Arena *arena, size_t sz, bool clear) {
@@ -58,11 +75,13 @@ static void *allocate(Arena *arena, size_t sz, bool clear) {
     ptr = &arena->cur->buf[arena->used];
     arena->used += aligned_sz;
   } else {
-    if (aligned_sz > ARENA_POOL_SIZE)
-      internal_error();
-    arena->cur = arena->cur->next = new_pool();
-    ptr = &arena->cur->buf;
-    arena->used = aligned_sz;
+    if (aligned_sz > ARENA_POOL_SIZE) {
+      ptr = allocate_oversized(arena, aligned_sz);
+    } else {
+      arena->cur = arena->cur->next = new_pool();
+      ptr = &arena->cur->buf;
+      arena->used = aligned_sz;
+    }
   }
 
 #if defined(USE_ASAN)
@@ -100,12 +119,13 @@ char *arena_format(Arena *arena, const char *fmt, ...) {
 #endif
     return ptr;
   }
-  if (aligned_sz > ARENA_POOL_SIZE)
-    internal_error();
-
-  arena->cur = arena->cur->next = new_pool();
-  ptr = &arena->cur->buf;
-  arena->used = aligned_sz;
+  if (aligned_sz > ARENA_POOL_SIZE) {
+    ptr = allocate_oversized(arena, aligned_sz);
+  } else {
+    arena->cur = arena->cur->next = new_pool();
+    ptr = &arena->cur->buf;
+    arena->used = aligned_sz;
+  }
 
 #if defined(USE_ASAN)
   __asan_unpoison_memory_region(ptr, aligned_sz);
@@ -134,6 +154,14 @@ void arena_on(Arena *arena) {
 }
 
 void arena_off(Arena *arena) {
+  // Oversized pools are all at the head of the chain: free them rather than
+  // recycling them as regular pools
+  while (arena->head && arena->head->oversized) {
+    Pool *tmp = arena->head;
+    arena->head = tmp->next;
+    free(tmp);
+  }
+
   if (free_alloc) {
     for (Pool *p = arena->head; p;) {
       Pool *tmp = p;

@@ -74,4 +74,7 @@ if not meson.is_subproject()
 
   smoke = executable('libslimcc-smoke', 'libslimcc-smoke.c', dependencies: slimcc_dep)
   test('zero-filesystem smoke', smoke)
+
+  strlit = executable('libslimcc-strlit', 'libslimcc-strlit.c', dependencies: slimcc_dep)
+  test('string literals', strlit)
 endif

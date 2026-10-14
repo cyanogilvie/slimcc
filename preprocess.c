@@ -1925,7 +1925,10 @@ static void join_adjacent_string_literals(Token *tok) {
   for (Token *t = tok->next; t != end; t = t->next)
     len = len + t->ty->array_len - 1;
 
-  char *buf = calloc(basety->size, len);
+  // cc1_arena, like the literals' own buffers (read_string_literal): the
+  // joined string outlives preprocessing but not the compile, and a raw calloc
+  // here leaked under libslimcc's compile churn.
+  char *buf = arena_calloc(&cc1_arena, (size_t)basety->size * len);
 
   int i = 0;
   for (Token *t = tok; t != end; t = t->next) {
